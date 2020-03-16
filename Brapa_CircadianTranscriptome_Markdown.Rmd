@@ -1,0 +1,1580 @@
+---
+title: Expansion of the circadian transcriptome in _Brassica_ _rapa_ and genome wide diversification
+  of paralog expression patterns
+author: "Ryan Sartor, Stevan Zorich and Kathleen Greenham"
+date: "3/10/2020"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup}
+knitr::opts_chunk$set(fig.width=6, fig.height=3, warning=FALSE, message=FALSE, echo = TRUE)
+```
+
+Load the required libraries.
+```{r loadLibs}
+require(edgeR)
+require(stringr)
+require(ggplot2)
+require(DiPALM)
+require(rain)
+require(WGCNA)
+require(circlize)
+```
+
+## Getting Started
+
+First, set some path variables. You will need to define the path where raw RNA-seq and annotation data files are stored (rawDataPath) and the path where you want outputs to go (outputPath).
+
+```{r dataPathsHidden, include=FALSE}
+rawDataPath = "/Users/greenham/Documents/UMN/Manuscripts/R500_Genome_Polyploidy_Clock/diPALM/Markdown/Markdown_GitHub/"
+outputPath= "/Users/greenham/Documents/UMN/Manuscripts/R500_Genome_Polyploidy_Clock/diPALM/Markdown/Markdown_GitHub/Output/"
+```
+```{r load, include=FALSE}
+# This block loads in some pre-run data objects to make this thing knit faster
+load(file.path(rawDataPath,"combined.RData"))
+```
+
+```{r dataPaths, eval=FALSE}
+rawDataPath = "~/Path/To/Input/Files/"
+outputPath= "~/Path/To/Output/Directory/"
+```
+
+A collection of functions is included as a supplemental file. Put this code into the 'rawDataPath' and source this code.
+
+```{r addFunctions}
+source(file.path(rawDataPath,"Rfunctions.R"))
+```
+### Raw Data 
+
+The first dataset contains time-course transcript expression from the two different entrainment conditions; photocycles (LD) and thermocycles (HC). Following entrainment, plants were shifted to constant conditions (LLHH), 24 hours later, leaf tissue was sampled every 2 hours for 48 hours.
+
+Raw counts from this data can be found on the NCBI GEO Accession: GSE123654 (https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE123654).
+
+Download the file: **'GSE123654_R500_LDHH_LLHC_rawCounts.csv'**.
+
+Place the file in the 'rawDataPath'.
+```{r loadLDHC}
+LDHC<-read.csv(file.path(rawDataPath,"GSE123654_R500_LDHH_LLHC_rawCounts.csv"),stringsAsFactors = F, row.names = 1)
+colnames(LDHC)<-gsub("ZT","ZT_",colnames(LDHC))
+```
+
+Load in the gene lengths (used for normalization). The .csv file is included as a supplemental table with the publication.
+
+```{r geneLen}
+BrLengths = read.csv(file.path(rawDataPath,"Brapa_GeneLengths.csv"),stringsAsFactors = F, row.names=1)
+BrLengths<-setNames(object = as.numeric(BrLengths[[1]]), nm = rownames(BrLengths))
+```
+
+Normalize with edgeR and log transform.
+
+```{r NormLDHC}
+cntsDge<- DGEList(counts = LDHC)
+cntsDge<- calcNormFactors(cntsDge)
+LDHCLog<- rpkm(cntsDge, log=T, gene.length = BrLengths[rownames(LDHC)], prior.count=0.1)
+```
+
+Look at LD and HC separately and filter genes based on expression level.
+Only retain genes with at least one sample with log10(FPKM) > 0.
+
+```{r FilterLDHC}
+LD<-LDHCLog[,grep("LD_",colnames(LDHCLog),fixed = T)]
+HC<-LDHCLog[,grep("HC_",colnames(LDHCLog),fixed = T)]
+
+LDexpressed<-apply(LD,1,function(x) max(x)>0)
+HCexpressed<-apply(HC,1,function(x) max(x)>0)
+LDandHCexpressed<-names(LDexpressed)[which(LDexpressed & HCexpressed)]
+
+LDfiltered<-LD[LDexpressed,]
+HCfiltered<-HC[HCexpressed,]
+LDandHCExpfiltered<-cbind(LD[LDandHCexpressed,],HC[LDandHCexpressed,])
+```
+
+Use the 'RAIN' R package to find the subset of cycling genes for each dataset
+(this will take 5-20 minutes for each ```rain()``` function call).
+
+```{r CallCycling, eval=F}
+LDRainRes<-rain(x = t(LDfiltered), deltat = 2, period = 24, period.delta = 4, nr.series = 2)
+HCRainRes<-rain(x = t(HCfiltered), deltat = 2, period = 24, period.delta = 4, nr.series = 2)
+repOrder<-as.numeric(rbind(1:48,49:96))
+LDandHCRainRes<-rain(x = t(LDandHCExpfiltered[,repOrder]), deltat = 2, period = 24, period.delta = 4, nr.series = 4)
+
+#****Save if you want to avoid re-running it in the future
+#save(LDRainRes,HCRainRes,LDandHCRainRes,file=file.path(outputPath,"RainResults.RData"))
+
+LDCycling<-row.names(LDRainRes)[which(LDRainRes$pVal<0.01)]
+HCCycling<-row.names(HCRainRes)[which(HCRainRes$pVal<0.01)]
+LDandHCCycling<-row.names(LDandHCRainRes)[which(LDandHCRainRes$pVal<0.01)]
+
+LDfiltered<-LDfiltered[LDCycling,]
+HCfiltered<-HCfiltered[HCCycling,]
+LDandHCfiltered<-LDandHCExpfiltered[LDandHCCycling,]
+```
+
+## Build Coexpression Networks
+
+In order to construct coexpression networks, the replicates are averaged.
+
+```{r LDHCAvgReps}
+# Remove the replicate labels
+LDAvgCols<-colnames(LDfiltered)
+LDAvgCols<-gsub("\\_R[[:digit:]]","",LDAvgCols)
+HCAvgCols<-colnames(HCfiltered)
+HCAvgCols<-gsub("\\_R[[:digit:]]","",HCAvgCols)
+LDandHCAvgCols<-colnames(LDandHCfiltered)
+LDandHCAvgCols<-str_extract(LDandHCAvgCols,"ZT_[[:digit:]]*")
+
+# Average replicates together
+LDAvg<-tapply(colnames(LDfiltered),INDEX = LDAvgCols, function(x) rowSums(as.data.frame(LDfiltered[,x]),na.rm = T)/length(x))
+HCAvg<-tapply(colnames(HCfiltered),INDEX = HCAvgCols, function(x) rowSums(as.data.frame(HCfiltered[,x]),na.rm = T)/length(x))
+LDandHCAvg<-tapply(colnames(LDandHCfiltered),INDEX = LDandHCAvgCols, function(x) rowSums(as.data.frame(LDandHCfiltered[,x]),na.rm = T)/length(x))
+
+# Since the timepoints get out of order with the tapply, we re-order the columns to be back in chronological order
+LDAvg<-do.call(cbind,LDAvg[order(as.numeric(sapply(strsplit(names(LDAvg),split = "_"),function(x) x[3])))])
+HCAvg<-do.call(cbind,HCAvg[order(as.numeric(sapply(strsplit(names(HCAvg),split = "_"),function(x) x[3])))])
+LDandHCAvg<-do.call(cbind,LDandHCAvg[order(as.numeric(sapply(strsplit(names(LDandHCAvg),split = "_"),function(x) x[2])))])
+
+```
+
+Gene coexpression networks are constructed using the WGCNA package run using batch mode to get a set of eigengenes.
+
+This first part can be run if desired. It is used to determine a good power value to use in network construction.
+
+```{r LDHC_WGCNA_Power, eval=F}
+  powers = c(c(1:10), seq(from = 12, to=20, by=2))
+  sftLD = pickSoftThreshold(t(LDAvg), powerVector = powers, verbose = 5)
+  sftHC = pickSoftThreshold(t(HCAvg), powerVector = powers, verbose = 5)
+  sftLDHC = pickSoftThreshold(t(LDandHCAvg), powerVector = powers, verbose = 5)
+
+# Scale-free topology fit index as a function of the soft-thresholding power
+   plot(sftLD$fitIndices[,1],(sftLD$fitIndices[,2]*-sign(sftLD$fitIndices[,3])),xlab="Soft Threshold (power)",ylab="Scale Free Topology Model Fit,signed R^2",main = paste("LD Scale independence"))
+   plot(sftHC$fitIndices[,1],(sftHC$fitIndices[,2]*-sign(sftHC$fitIndices[,3])),xlab="Soft Threshold (power)",ylab="Scale Free Topology Model Fit,signed R^2",main = paste("HC Scale independence"))
+   plot(sftLDHC$fitIndices[,1],(sftLDHC$fitIndices[,2]*-sign(sftLDHC$fitIndices[,3])),xlab="Soft Threshold (power)",ylab="Scale Free Topology Model Fit,signed R^2",main = paste("LDHC Scale independence"))
+```
+
+We've decided on a power of 10. 
+
+Now construct the networks.
+
+```{r LDHC_WGCNA, eval=F}
+BlockModsLD<- blockwiseModules(datExpr = t(LDAvg), power = 10, networkType = "signed", corType="bicor", TOMType="signed", minModuleSize=100, mergeCutHeight=0.2, deepSplit=2, pamRespectsDendro = F, nThreads = 4, verbose=7)
+BlockModsHC<- blockwiseModules(datExpr = t(HCAvg), power = 10, networkType = "signed", corType="bicor", TOMType="signed", minModuleSize=100, mergeCutHeight=0.2, deepSplit=2, pamRespectsDendro = F, nThreads = 4, verbose=7)
+BlockModsLDHC<- blockwiseModules(datExpr = t(LDandHCAvg), power = 10, networkType = "signed", corType="bicor", TOMType="signed", minModuleSize=100, mergeCutHeight=0.2, deepSplit=2, pamRespectsDendro = F, nThreads = 4, verbose=7)
+
+#**** Save if you want to avoid re-running it in the future
+#save(BlockModsLD,BlockModsHC,BlockModsLDHC,file=file.path(outputPath,"WGCNAMods_LDHC.RData"))
+
+# Rename the eigengenes to just colors
+colnames(BlockModsLD[[3]])<-gsub("^ME","",colnames(BlockModsLD[[3]]))
+colnames(BlockModsHC[[3]])<-gsub("^ME","",colnames(BlockModsHC[[3]]))
+colnames(BlockModsLDHC[[3]])<-gsub("^ME","",colnames(BlockModsLDHC[[3]]))
+
+# Only compare common genes
+intCols<-intersect(names(BlockModsLD$colors),names(BlockModsHC$colors))
+
+```
+
+### Visualize Network Modules
+
+Plot the clustered heatmaps to display expression patterns of gene modules.
+
+First make some color palettes.
+
+```{r ColorPalettes, fig.width=6, fig.height=2}
+# Blue - Orange Palette (used for the heatmap expression intensity)
+boCols<-c(rgb(0,0,0.6,1),"white","darkorange")
+boFunc<-colorRampPalette(colors = boCols, bias = 0.7)
+blueOrange<-boFunc(50)
+barplot(rep(1,50),col=blueOrange, main="blueOrange Heatmap")
+
+# Blue-Green Palette (used to distinguish between different modules)
+bgCols<-c(rgb(0,0,0.3,1),rgb(0.9,0,0.9,1),"white",rgb(0.9,0.9,0,1),rgb(0,0.3,0,1))
+bgFunc<-colorRampPalette(colors = bgCols, bias = 1)
+blueGreenLD<-bgFunc(14)
+names(blueGreenLD)<-paste("LD_",str_pad(string = c(1:14),width = 2,pad = "0"),sep="")
+barplot(rep(1,14),col=blueGreenLD, main="blueGreenLD")
+blueGreenHC<-bgFunc(10)
+names(blueGreenHC)<-paste("HC_",str_pad(string = c(1:10),width = 2,pad = "0"),sep="")
+barplot(rep(1,10),col=blueGreenHC, main="blueGreenHC")
+blueGreenLDHC<-bgFunc(12)
+names(blueGreenLDHC)<-paste("LDHC_",str_pad(string = c(1:12),width = 2,pad = "0"),sep="")
+barplot(rep(1,12),col=blueGreenLDHC, main="blueGreenLDHC")
+```
+
+Reorganize the modules so they are arranged by phase and relabel them. 
+
+```{r OrganizeHeatmaps}
+# Manually rearrange modules based on phase (peak expression time)
+LDcOrd<-c("turquoise","greenyellow","brown","magenta","purple", "black", "blue", "tan", "salmon", "pink" ,"red","green", "cyan", "yellow")
+HCcOrd<-c("turquoise","yellow","pink","black","brown", "purple","blue","magenta","green","red")
+LDHCcOrd<-c("pink","brown","black","purple","magenta","greenyellow","green","blue","turquoise","tan","red","yellow")
+
+# Re-map the module names assigned by WGCNA to our LD/HC numbers
+LDcMap<-names(blueGreenLD)
+names(LDcMap)<-LDcOrd
+HCcMap<-names(blueGreenHC)
+names(HCcMap)<-HCcOrd
+LDHCcMap<-names(blueGreenLDHC)
+names(LDHCcMap)<-LDHCcOrd
+
+LDcolors<-setNames(LDcMap[BlockModsLD$colors],nm = names(BlockModsLD$colors))
+HCcolors<-setNames(HCcMap[BlockModsHC$colors],nm = names(BlockModsHC$colors))
+LDHCcolors<-setNames(LDHCcMap[BlockModsLDHC$colors],nm = names(BlockModsLDHC$colors))
+
+# Reorder the genes in the phase order
+LDdf<-data.frame(Module=sort(LDcolors[intCols]))
+HCdf<-data.frame(Module=sort(HCcolors[intCols]))
+LDHCdf<-data.frame(Module=sort(LDHCcolors))
+```
+
+Finally, plot the heatmaps using the 'pheatmap' package.
+
+```{r LHDCheatmaps, fig.width=5, fig.height=8}
+require(pheatmap)
+#pdf(file.path(outputPath,"Figure1_LDheatmap.pdf"),width = 5,height = 6)
+pheatmap(LDAvg[row.names(LDdf),],cluster_rows = F, cluster_cols = F, scale = "row", color= blueOrange, annotation_row = LDdf, annotation_colors = list(Module=blueGreenLD), show_rownames = F, labels_col = gsub("LD_","",colnames(LDAvg),fixed = T))
+#dev.off()
+
+#pdf(file.path(outputPath,"Figure1_HCheatmap.pdf"),width = 5,height = 6)
+pheatmap(HCAvg[row.names(HCdf),],cluster_rows = F, cluster_cols = F, scale = "row",color = blueOrange, annotation_row = HCdf, annotation_colors = list(Module=blueGreenHC), show_rownames = F, labels_col = gsub("HC_","",colnames(HCAvg),fixed = T))
+#dev.off()
+
+```
+
+To examine the overlap between LD and HC derived modules, we compare the correlation of expression patterns of module eigengenes as well as the overlap of genes contained within the modules.
+
+```{r LDvsHC_Modules}
+# Calculate eigengene correlations
+cTable<-cor(BlockModsLD$MEs,BlockModsHC$MEs)
+cTable<-cTable[LDcOrd,HCcOrd]
+rownames(cTable)<-LDcMap[rownames(cTable)]
+colnames(cTable)<-HCcMap[colnames(cTable)]
+
+# Calculate gene overlap statistics
+pTable<-overlapTable(labels1 = LDcolors[intCols],labels2 = HCcolors[intCols])
+pTableCnt<-pTable$countTable
+pTable<-pTable$pTable
+pTable[pTable==0]<-min(pTable[pTable>0])
+pTable<--log10(pTable)
+pTable<-pTable[row.names(cTable),colnames(cTable)]
+pTableCnt<-pTableCnt[row.names(cTable),colnames(cTable)]
+
+# Generate dataframes to be used for plotting the modules (size and color) on a circos plot
+LDtab<-table(LDdf)[LDcMap]
+circDFLD<-data.frame(module=names(LDtab),color=blueGreenLD[names(LDtab)],Min=1,Max=as.numeric(LDtab), stringsAsFactors = F)
+HCtab<-table(HCdf)[HCcMap]
+circDFHC<-data.frame(module=names(HCtab),color=blueGreenHC[names(HCtab)],Min=1,Max=as.numeric(HCtab), stringsAsFactors = F)
+circDF<-rbind(circDFLD[nrow(circDFLD):1,],circDFHC)
+```
+
+Generate a circos plot to visualize the relationships between LD and HC modules.
+
+```{r LDvsHC_CircosPlot, fig.width=6, fig.height=6}
+# Build color map for circos links
+colTable<-cTable
+colTable[1:length(cTable)]<-adjustcolor(ReturnColorMap(as.numeric(cTable),ColVec = c("blue","yellow","red")),alpha.f = 0.5)
+# Heights of the labels
+labOff<-c(rep(2,14),1.4,rep(2,9))
+
+#pdf("file.path(outputPath,"Figure1_Circos.pdf"),width = 6,height = 6)
+circos.clear()
+circos.par(cell.padding = c(0, 0, 0, 0), start.degree=270, track.height=0.1)
+circos.initialize(factors=factor(circDF$module,levels = circDF$module),xlim=cbind(circDF$Min, circDF$Max))
+circos.track(factors = factor(circDF$module,levels = circDF$module), ylim=c(0,1), track.margin=c(0,0.1), panel.fun = function(x, y){
+  i = get.cell.meta.data("sector.numeric.index")
+  xlim = get.cell.meta.data("xlim")
+  #print(paste(labOff[i],circDF$color[i]))
+  circos.text(CELL_META$xcenter,labOff[i], cex=0.7, font=2, circDF$module[i], facing="downward")
+  circos.rect(xleft = xlim[1],xright = xlim[2], ybottom = 0, ytop = 1, track.index = 1, col=circDF$color[i])
+})
+# Loop through the pValue table comparing modules and plot links for the significant ones
+# Keep track of total links for each module
+rSum<-setNames(rep(0,nrow(pTable)),nm = rownames(pTable))
+cSum<-setNames(rep(0,nrow(pTable)),nm = colnames(pTable))
+
+for(r in row.names(pTable))
+{
+  for(c in colnames(pTable))
+  {
+    if(pTable[r,c]>=2)
+    {
+      newR<-rSum[r]+pTableCnt[r,c]
+      newC<-cSum[c]+pTableCnt[r,c]
+      #print(paste(r,(rSum[r]+1),newR,c,(cSum[c]+1),newC))
+      circos.link(sector.index1 = r, point1 = c((rSum[r]+1),newR), sector.index2 = c, point2 = c((cSum[c]+1),newC), col=colTable[r,c])
+      rSum[r]<-newR
+      cSum[c]<-newC
+    }
+  }
+}
+#dev.off()
+
+# Plot a legend for the circos plot
+  #pdf(file.path(outputPath,"Figure1_CircosLegend.pdf"),width = 2,height = 6)
+  #s<-seq(0,1,length.out = 20)
+  #c<-ReturnColorMap(s,ColVec = c("yellow","red"))
+  #par(mar=c(1,4,1,1),cex=1.5)
+  #BlankPlot(xrng = c(0,1),yrng = c(0,1.1), ylab="Module Expression Pearson Correlation")
+  #rect(xleft = 0,xright = 1,ybottom = s,ytop = s+(s[2]-s[1]),col = adjustcolor(c,alpha.f = 0.5))
+  #axis(side = 2, at=pretty(s)+(0.5*(s[2]-s[1])), labels = pretty(s),font=2,tick = F,line = -1)
+  #dev.off()
+```
+
+GO Biological Process categorical enrichment of LD and HC modules. This block uses the supplemental files **'GO_BP_Annotations.csv'** and **'GO_Term_Descriptions.csv'**. Make sure these files are placed in your 'rawDataPath' folder. 
+
+```{r LDHC_CategoricalEnrichment, eval=F}
+
+# Temp load("~/Documents/McClungLab/Brassica/GOAnnotate/R500_CategoricalEnrich.RData")
+# First load the Brassica R500 GO BP annotations 
+BrEnrichGO_BP = read.csv(file.path(rawDataPath,"GO_BP_Annotations.csv"),stringsAsFactors = F)
+
+# This function is used to put the annotations in a useful format to calculate categorical enrichment
+BrEnrichGO_BP = BuildEnrichMaps(inDF = BrEnrichGO_BP)
+
+# Load the GO term descriptions
+GODescriptions<-read.csv(file.path(rawDataPath,"GO_Term_Descriptions.csv"),stringsAsFactors = F)
+GODescriptions<-setNames(object = GODescriptions$Description, nm = GODescriptions$Goterm)
+
+# Group the genes into a list of modules
+LDmods<-tapply(X = names(LDcolors), INDEX = LDcolors, function(x) x)
+HCmods<-tapply(X = names(HCcolors), INDEX = HCcolors, function(x) x)
+
+# Calculate categorical enrichment for each module
+EnrichLstLD<-lapply(LDmods,function(x) CalcEnrich(MapBuild = BrEnrichGO_BP, testvec = x, codedesc = GODescriptions, refvec = LDCycling))
+EnrichLstHC<-lapply(HCmods,function(x) CalcEnrich(MapBuild = BrEnrichGO_BP, testvec = x, codedesc = GODescriptions, refvec = HCCycling))
+
+# Filter out all non-significant categories
+EnrichLstLD<-lapply(EnrichLstLD,function(x) x@CatList[which(as.numeric(x@CatList[,"Adj_P-Value"]) <= 0.01),,drop=F])
+EnrichLstHC<-lapply(EnrichLstHC,function(x) x@CatList[which(as.numeric(x@CatList[,"Adj_P-Value"]) <= 0.01),,drop=F])
+
+# If desired, write the output to the output folder
+dir.create(path = file.path(outputPath,"LDandHC_GOenrich"))
+sapply(names(EnrichLstLD), function(x) write.csv(EnrichLstLD[[x]],file=file.path(outputPath,"LDandHC_GOenrich",paste(x,".csv",sep=""))))
+sapply(names(EnrichLstHC), function(x) write.csv(EnrichLstHC[[x]],file=file.path(outputPath,"LDandHC_GOenrich",paste(x,".csv",sep=""))))
+```
+
+### LD and HC Expression Analysis Using DiPALM
+
+The LD and HC entrainments definitely result in some differences in gene expression. Next we run the DiPALM analysis in order to find genes with significantly different expression patterns.
+
+```{r LDvsHC_DiPALM, eval=F}
+# First split up the data matrix into separate time-courses for comparison
+LDHCfiltered = LDandHCfiltered
+spNms<-strsplit(x = colnames(LDHCfiltered), split = "_")
+tnms<-sapply(spNms,function(x) paste(x[c(1,4)],collapse = "."))
+colnames(LDHCfiltered)<-sapply(spNms,function(x) paste(x[2:3],collapse = ""))
+TCsLDvHC<- tapply(X = 1:length(tnms),INDEX = tnms, function(x) LDHCfiltered[,x])
+
+# Now re-combine them in order to calculate eigengenes
+TCsAll<-do.call(rbind,TCsLDvHC)
+BlockModsLDvHC<- blockwiseModules(datExpr = t(TCsAll), power = 10, networkType = "signed", corType="bicor", TOMType="signed", minModuleSize=100, mergeCutHeight=0.2, deepSplit=1, pamRespectsDendro = F, nThreads = 4, verbose=3)
+
+#**** Save if you want to avoid re-running it in the future
+#save(BlockModsLDvHC,file=file.path(outputPath,"LDvsHCDipalmBlockMods.RData"))
+
+# Pull out the module eigengenes
+MEs<-BlockModsLDvHC[[3]]
+
+# Calculate kMEs and kMeds
+kMEs<-BuildModMembership(MeMat = MEs, TCsLst = TCsLDvHC)
+kMed<-sapply(TCsLDvHC,function(x) apply(x,1,function(y) median(y,na.rm = T)))
+
+# Build a permuted expression set
+TCsLDvHCPerm<-lapply(TCsLDvHC,function(x) x[sample(1:nrow(x),100000,replace = T),])
+kMEsPerm<-BuildModMembership(MeMat = MEs, TCsLst = TCsLDvHCPerm)
+kMedPerm<-sapply(TCsLDvHCPerm,function(x) apply(x,1,function(y) median(y,na.rm = T)))
+
+# Define models
+tFact<-as.factor(rep(c("HC","LD"),each=2))
+design<-model.matrix(~0+tFact)
+# Define the contrast 
+contr<-"tFactHC-tFactLD"
+
+# Fit the models
+LimmaModsMEs<-lapply(kMEs, function(x) BuildLimmaLM(dataMat = x, designMat = design, contrastStr = contr))
+LimmaModsMed<-BuildLimmaLM(dataMat = kMed, designMat = design, contrastStr = contr)
+
+# Pull out the t-statistics
+LimmaModsMEs<-do.call(cbind,lapply(LimmaModsMEs,function(x) x$t))
+LimmaModsMed<-LimmaModsMed$t
+gc()
+
+# Fit the permuted data
+LimmaModsMEsPerm<-lapply(kMEsPerm, function(x) BuildLimmaLM(dataMat = x, designMat = design, contrastStr = contr))
+LimmaModsMedPerm<-BuildLimmaLM(dataMat = kMedPerm, designMat = design, contrastStr = contr)
+LimmaModsMEsPerm<-do.call(cbind,lapply(LimmaModsMEsPerm,function(x) x$t))
+LimmaModsMedPerm<-LimmaModsMedPerm$t
+gc()
+
+# Sum the test statistics
+TestSumsMEs<-apply(LimmaModsMEs,1, function(x) sum(abs(x),na.rm = T))
+TestSumsMed<-abs(LimmaModsMed[,1])
+PermSumsMEs<-apply(LimmaModsMEsPerm,1, function(x) sum(abs(x),na.rm = T))
+PermSumsMed<-abs(LimmaModsMedPerm[,1])
+
+# It can be informative to plot the distributions of the test genes vs. the permuted distribution
+ggPlotMultiDensities(denslist = list(Test=TestSumsMEs,Permuted=PermSumsMEs), main = "Pattern Change Scores", xlab = "Differential Pattern Score",lwidth = 1, scale = F)
+ggPlotMultiDensities(denslist = list(Test=TestSumsMed,Permuted=PermSumsMed), main = "Pattern Change Scores", xlab = "Differential Median Expression Score",lwidth = 1, scale = F)
+
+AdjMEsLDvHC<-sapply(TestSumsMEs,function(x) AdjustPvalue(tVal = x, tVec = TestSumsMEs, pVec = PermSumsMEs))
+AdjMedLDvHC<-sapply(TestSumsMed,function(x) AdjustPvalue(tVal = x, tVec = TestSumsMed, pVec = PermSumsMed))
+
+SigMEsLDvHC<-AdjMEsLDvHC[which(AdjMEsLDvHC<0.01)]
+SigMedLDvHC<-AdjMedLDvHC[which(AdjMedLDvHC<0.01)]
+
+```
+
+All genes in this DiPALM analysis are cycling. The set of genes that have different cycling patterns dependent upon entrainment conditions is interesting but we do not pursue these further in this study. We will however, look at GO categorical enrichment of this set.
+
+```{r GO_Cyc_DiffEntrain, eval=F}
+
+diffEntrain_Enrich<-CalcEnrich(MapBuild = BrEnrichGO_BP, testvec = names(SigMEsLDvHC), codedesc = GODescriptions, refvec = LDandHCCycling)
+diffEntrain_Enrich<-diffEntrain_Enrich@CatList[which(as.numeric(diffEntrain_Enrich@CatList[,"Adj_P-Value"]) <= 0.01),,drop=F]
+write.csv(diffEntrain_Enrich,file=file.path(outputPath,"LDandHC_GOenrich","Differential_Pattern.csv"))
+
+```
+
+## Expression Level Analysis of Retained Paralogs
+
+Now we begin to look at 2 and 3-copy _B.rapa_ paralogs.
+
+We have defined two types of homologous relationships:
+\newline
+
+  1) There exists one Arabidopsis ortholog and two _B. rapa_ paralogs. These sets are defined in the supplemental file: **"At_Br_Orthologs2.csv"**.
+\newline
+
+  2) There exists one Arabidopsis ortholog and three _B. rapa_ paralogs. These sets are defined in the supplemental file: **"At_Br_Orthologs3.csv"**.
+\newline
+
+Both of these files should be placed in your 'rawDataPath' folder. 
+
+First, we look for a relationship between retained copies of genes and expression level.
+
+```{r CopyVsNoncopy}
+# Cycling of Br and At paralogs
+# First load the homolog data
+BrOrtho2<-read.csv(file.path(rawDataPath,"At_Br_Orthologs2.csv"),stringsAsFactors = F)
+BrOrtho3<-read.csv(file.path(rawDataPath,"At_Br_Orthologs3.csv"),stringsAsFactors = F)
+
+# Convert 3-copy sets to 2-copy comparisons and combine all
+Br2<-lapply(1:nrow(BrOrtho2),function(x) as.character(BrOrtho2[x,2:3]))
+Br3<-lapply(1:nrow(BrOrtho3),function(x) as.character(BrOrtho3[x,2:4]))
+Br23<-c(Br2,Br3)
+
+# Only retain pairs with at least 2 cycling copies
+BrCyc<-lapply(Br23,function(x) intersect(x,LDandHCCycling))
+tLen<-sapply(BrCyc,length)
+Br2Cyc<-BrCyc[which(tLen>1)]
+
+# Define set of genes that are cycling copies
+BrCopied<-unlist(Br2Cyc)
+BrAll<-LDandHCCycling
+
+# Define set of genes that are cycling and not copies
+BrNoCopy<-setdiff(BrAll,BrCopied)
+```
+
+We observe higher expression (in general) in the set of copied genes. Is this an effect of the higher or lower expressed copy being generally higher? 
+
+To test this, we generate random pairs of single copy genes and compare to our paralogous gene pairs.
+
+```{r CopyPairsVsNoncopyPairs}
+
+# Make random pairs of single copy genes
+Br2Rand1<-sample(BrNoCopy, floor(length(BrNoCopy)/2), replace = F)
+Br2Rand2<-setdiff(BrNoCopy,Br2Rand1)[1:length(Br2Rand1)]
+Br2Rand<-lapply(1:length(Br2Rand1),function(x) c(Br2Rand1[x],Br2Rand2[x]))
+
+# Split paralogous pairs based on expresssion 
+BrAvgExpr<-apply(LDandHCExpfiltered,1,function(x) mean(x,na.rm=T))
+
+BrCopyHighExp<-sapply(Br2Cyc,function(x) x[which.max(BrAvgExpr[x])])
+BrCopyLowExp<-sapply(Br2Cyc,function(x) x[which.min(BrAvgExpr[x])])
+
+RandCopyHighExp<-sapply(Br2Rand,function(x) x[which.max(BrAvgExpr[x])])
+RandCopyLowExp<-sapply(Br2Rand,function(x) x[which.min(BrAvgExpr[x])])
+
+# Put all the results together in a list
+BrListExp<-list("Br_NoCopy"=BrNoCopy,"Br_Copied"=BrCopied,"RanPairs_HiExp"=RandCopyHighExp, "RanPairs_LoExp"=RandCopyLowExp, "BrCopy_HiExp"=BrCopyHighExp,"BrCopy_LoExp"=BrCopyLowExp)
+ExpList<-lapply(BrListExp,function(x) BrAvgExpr[x])
+names(ExpList)<-paste(names(ExpList)," [",sapply(ExpList,length),"]",sep="")
+
+# Anova test for significance
+ExpDf<-data.frame(Exp=unlist(ExpList),Group=rep(names(ExpList),times=sapply(ExpList,length)))
+ExpAnov<-aov(formula = Exp ~ Group, data = ExpDf)
+ExpTuk<-TukeyHSD(x = ExpAnov)
+```
+
+Plot the results.
+
+```{r CopyVsNonCopyPlots, fig.width=4, fig.height=6}
+#pdf(file.path(outputPath,"Figure2_A.pdf"),width = 3,height = 5)
+ggp<-ggboxplot(dList = ExpList[1:2], cols = c("red","blue"), notch = T, notchLines = F, ledge = F, ylab = "Expression Log2(FPKM)", ylim = c(-5,10))
+bracketDf<-data.frame(x1=c(1,1,2),y1=c(10,9.5,9.5),x2=c(2,1,2),y2=c(10,10,10))
+ggp<-ggp+geom_segment(data=bracketDf, mapping=aes(x=x1,y=y1,xend=x2,yend=y2), lty=1, lwd=0.6, color=rep("grey40",3))
+pValDF<-data.frame(x=c(1.5),y=c(9.5),lab=c("P-value: 0.000"))
+ggp<-ggp+geom_text(mapping = aes(x=x,y=y,label=lab), data = pValDF)
+ggp
+#dev.off()
+
+
+#pdf(file.path(outputPath,"Figure2_B.pdf"),width = 6,height = 5)
+ggp<-ggboxplot(dList = ExpList[3:6], cols = c(rgb(0.5,0,0),rgb(1,0.5,0.5),rgb(0,0,0.5),rgb(0.5,0.5,1)), notch = T, notchLines = F, ledge = F, ylab = "Expression Log2(FPKM)", ylim = c(-5,10))
+
+# Manually annotate p-values
+bracketDf<-data.frame(x1=c(1,2,1,3,2,4),y1=c(10,-5,9.5,9.5,-4.5,-4.5),x2=c(3,4,1,3,2,4),y2=c(10,-5,10,10,-5,-5))
+ggp<-ggp+geom_segment(data=bracketDf, mapping=aes(x=x1,y=y1,xend=x2,yend=y2), lty=1, lwd=0.6, color=rep("grey40",6))
+pValDF<-data.frame(x=c(2,3),y=c(9.5,-4.5),lab=c("P-value: 0.981","P-value: 0.000"))
+ggp<-ggp+geom_text(mapping = aes(x=x,y=y,label=lab), data = pValDF)
+ggp
+#dev.off()
+```
+
+### Phase Distribution of Paralogs in the LDHC Network
+
+Plot the module eigengenes for the combined LDHC expression modules.
+
+```{r LDHC_ModuleExpression, fig.width=6, fig.height=6}
+# Look at the LDHC modules
+LDHC_MEs<-BlockModsLDHC$MEs[,names(LDHCcMap)]
+colnames(LDHC_MEs)<-LDHCcMap
+
+#pdf(file.path(outputPath,"Figure2_C.pdf"),width = 6,height = 6)
+pheatmap(t(LDHC_MEs),cluster_rows = F, cluster_cols = F, scale = "row",color = blueOrange, labels_col = gsub("_","",colnames(LDandHCAvg),fixed = T))
+#dev.off()
+```
+
+Next we ask if paralogous genes are enriched or depleted for any specific peak expresssion times (phase).
+
+```{r LDHCPhase_Enrich}
+# Group all the LDHC modules
+LDHCmods<-tapply(X = names(LDHCcolors), INDEX = LDHCcolors, function(x) x)
+
+# Test each module for enrichment and depletion of multi-copy genes
+LDHCcycleEnrich<-sapply(LDHCmods,function(x) PhyperOverlap(set1 = x,set2 = unique(BrCopied),backset = BrAll,nlog10 = T))
+LDHCcycleDeplete<-sapply(LDHCmods,function(x) PhyperOverlap(set1 = x,set2 = unique(BrCopied),backset = BrAll,nlog10 = T,lowerTail = T))
+phypRes<-cbind(LDHCcycleEnrich,LDHCcycleDeplete)
+
+# Impose a negative sign on depleted modules and leave enriched modules positive
+phypRes<-ifelse(test = LDHCcycleEnrich>LDHCcycleDeplete, yes = LDHCcycleEnrich, no = (LDHCcycleDeplete*-1))
+ngeneRes<-sapply(LDHCmods,length)
+
+# Generate dataframe for ggplot2 
+ggdf<-data.frame(pVal=phypRes,numGene=ngeneRes,module=factor(names(phypRes),levels = rev(names(phypRes))))
+```
+
+Generate plots.
+
+```{r PlotPhaseCopyData, fig.width=4, fig.height=6}
+#pdf(file.path(outputPath,"Fig2D_1.pdf"),width = 4,height = 6)
+ggplot(data = ggdf, mapping = aes(x=module, y = ggdf$pVal)) + geom_bar(stat = "identity", aes(fill=module)) + coord_flip() + labs(title="Enrichment", y="-log10(depletion/enrichment pValue)") + scale_fill_manual(values = blueGreenLDHC) + theme_bw() + theme(legend.position="none")
+#dev.off()
+
+#pdf(file.path(outputPath,"Fig2D_2.pdf"),width = 4,height = 6)
+ggplot(data = ggdf, mapping = aes(x=module, y = ggdf$numGene)) + geom_bar(stat = "identity", aes(fill=module)) + coord_flip() + labs(title="Number of Genes", y="Number of Genes/Module") + scale_fill_manual(values = blueGreenLDHC) + theme_bw() + theme(legend.position="none")
+#dev.off()
+```
+
+Enrichment analysis of genes represented in the morning and evening phased modules that are over-represented for multi-copy genes.
+
+```{r PhaseEnrich, eval=F}
+# Pull out all the multi-copy genes from enriched and depleted modules
+LDHCcopyEnriched<-unlist(LDHCmods[which(phypRes>(-log10(0.05)))])
+LDHCcopiedMorning<-intersect(LDHCcopyEnriched,BrCopied)
+LDHCcopyDepleted<-unlist(LDHCmods[which(phypRes<(-(-log10(0.05))))])
+LDHCcopiedEvening<-intersect(LDHCcopyDepleted,BrCopied)
+
+# Calculate GO categorical enrichment
+EnrichLstLDHC<-lapply(list(MorningCopies=LDHCcopiedMorning, EveningCopies=LDHCcopiedEvening),function(x) CalcEnrich(MapBuild = BrEnrichGO_BP, testvec = x, codedesc = GODescriptions, refvec = LDandHCCycling))
+
+# Filter out all non-significant categories
+EnrichLstLDHC<-lapply(EnrichLstLDHC,function(x) x@CatList[which(as.numeric(x@CatList[,"Adj_P-Value"]) <= 0.01),])
+
+# Output the results
+dir.create(path = file.path(outputPath,"LDHC_MorningEveningGOEnrich"))
+sapply(names(EnrichLstLDHC), function(x) write.csv(EnrichLstLDHC[[x]],file=file.path(outputPath,"LDHC_MorningEveningGOEnrich",paste(x,".csv",sep=""))))
+```
+
+### Expression Pattern Analysis of Paralog Pairs
+
+Next we want to find out how many _B. rapa_ paralog pairs have divergent expression patterns.
+For this, we use DiPALM. We treat the LD and HC data sets like replicates in order to increase our statistical power to detect divergent expression patterns. DiPALM operates on a linear model framework using the limma package. Thus, we can include LD and HC as potential covariates into our model in order to account for the effects between these two conditions.
+
+```{r LDHC_DiPALM_Br1VsBr2, eval=F}
+# For simplicity, convert all of the 3-copy B. rapa paralog sets into 3, 2-copy sets and combine with the actual 2-copy pairs
+LDHCfiltered<-LDandHCExpfiltered
+Br2a<-setNames(BrOrtho2,nm = c("At","Br1","Br2"))
+Br2b<-setNames(BrOrtho3[,-2],nm = c("At","Br1","Br2"))
+Br2c<-setNames(BrOrtho3[,-3],nm = c("At","Br1","Br2"))
+Br2d<-setNames(BrOrtho3[,-4],nm = c("At","Br1","Br2"))
+Br2s<-rbind(Br2a,Br2b,Br2c,Br2d)
+
+# Retain only the pairs where both copies have expression data
+Br2s<-Br2s[which(Br2s[,2]%in%rownames(LDHCfiltered) & Br2s[,3]%in%rownames(LDHCfiltered)),-1]
+
+# Assign some row names
+rNms<-paste(Br2s[,1],Br2s[,2],sep="_")
+rownames(Br2s)<-rNms
+
+# Split up orthologs
+cntsLogPara2<-lapply(colnames(Br2s),function(x) LDHCfiltered[Br2s[,x],])
+for(n in 1:ncol(Br2s))
+{
+  colnames(cntsLogPara2[[n]])<-paste(colnames(Br2s)[n],colnames(cntsLogPara2[[n]]),sep = "_")
+}
+cntsLogPara2<-do.call(cbind,cntsLogPara2)
+row.names(cntsLogPara2)<-rNms
+
+# Convert expression data into a list of the different time-courses
+spNms<-strsplit(x = colnames(cntsLogPara2), split = "_")
+tnms<-sapply(spNms,function(x) paste(x[c(1,2,5)],collapse = "."))
+colnames(cntsLogPara2)<-sapply(spNms,function(x) paste(x[3:4],collapse = ""))
+TCsPara<- tapply(X = 1:length(tnms),INDEX = tnms, function(x) cntsLogPara2[,x])
+
+TCsAll<-do.call(rbind,TCsPara)
+# Run WGCNA to get eigengene vectors
+BlockMods_LDHCBr1vBr2<- blockwiseModules(datExpr = t(TCsAll), power = 10, networkType = "signed", corType="bicor", TOMType="signed", minModuleSize=100, mergeCutHeight=0.2, deepSplit=2, pamRespectsDendro = F, nThreads = 4, verbose=7)
+
+#****Save if you want to avoid re-running it in the future
+#save(BlockMods_LDHCBr1vBr2,file=file.path(outputPath,"DiPALM_LDHC_Br1vBr2_BlockMods.RData"))
+
+# Pull out MEs
+MEs<-BlockMods_LDHCBr1vBr2[[3]]
+
+# Define models
+BrFact<-as.factor(rep(c("BR1","BR2"),each=4))
+
+# Include the LD/HC as a factor in the model
+LDHCFact<-as.factor(rep(c("HC","HC","LD","LD"),times=2))
+design<-model.matrix(~0+BrFact+LDHCFact)
+contr<-"BrFactBR1-BrFactBR2"
+
+# Run DiPALM analysis
+kMEs<-BuildModMembership(MeMat = MEs, TCsLst = TCsPara)
+Med<-sapply(TCsPara,function(x) apply(x,1,function(y) median(y,na.rm = T)))
+
+TCsParaPerm<-lapply(TCsPara,function(x) x[sample(1:nrow(x),100000,replace = T),])
+kMEsPerm<-BuildModMembership(MeMat = MEs, TCsLst = TCsParaPerm)
+MedPerm<-sapply(TCsParaPerm,function(x) apply(x,1,function(y) median(y,na.rm = T)))
+
+LimmaModskMEs<-lapply(kMEs, function(x) BuildLimmaLM(dataMat = x, designMat = design, contrastStr = contr))
+LimmaModsMed<-BuildLimmaLM(dataMat = Med, designMat = design, contrastStr = contr)
+LimmaModskMEs<-do.call(cbind,lapply(LimmaModskMEs,function(x) x$t))
+LimmaModsMed<-LimmaModsMed$t
+gc()
+
+LimmaModskMEsPerm<-lapply(kMEsPerm, function(x) BuildLimmaLM(dataMat = x, designMat = design, contrastStr = contr))
+LimmaModsMedPerm<-BuildLimmaLM(dataMat = MedPerm, designMat = design, contrastStr = contr)
+LimmaModskMEsPerm<-do.call(cbind,lapply(LimmaModskMEsPerm,function(x) x$t))
+LimmaModsMedPerm<-LimmaModsMedPerm$t
+gc()
+
+TestSumskMEs<-apply(LimmaModskMEs,1, function(x) sum(abs(x)))
+TestSumsMed<-abs(LimmaModsMed[,1])
+PermSumskMEs<-apply(LimmaModskMEsPerm,1, function(x) sum(abs(x)))
+PermSumsMed<-abs(LimmaModsMedPerm[,1])
+
+# If desired, plot the score distributions of tested genes vs. the permuted genes
+ggPlotMultiDensities(denslist = list(Test=TestSumskMEs,Permuted=PermSumskMEs), main = "Pattern Change Scores", xlab = "Differential Pattern Score",lwidth = 1, scale = F)
+ggPlotMultiDensities(denslist = list(Test=TestSumsMed,Permuted=PermSumsMed), main = "Expression Change Scores", xlab = "Differential Expression Score",lwidth = 1, scale = F)
+
+AdjkMEsLDHCBr1vBr2<-sapply(TestSumskMEs,function(x) AdjustPvalue(tVal = x, tVec = TestSumskMEs, pVec = PermSumskMEs))
+AdjMedLDHCBr1vBr2<-sapply(TestSumsMed,function(x) AdjustPvalue(tVal = x, tVec = TestSumsMed, pVec = PermSumsMed))
+
+SigkMEsLDHCBr1vBr2<-AdjkMEsLDHCBr1vBr2[which(AdjkMEsLDHCBr1vBr2<0.01)]
+SigMedLDHCBr1vBr2<-AdjMedLDHCBr1vBr2[which(AdjMedLDHCBr1vBr2<0.01)]
+```
+
+Now we see that over 1800 _B. rapa_ paralog pairs show divergent expression patterns. Is this divergence random or can we cluster pairs based on ones that diverge in a similar way?
+
+```{r LDHC_Br1vBr2_Clusters, fig.width=6, fig.height=10}
+
+# Cluster the paralogs based on pattern difference and also on expression difference
+# The figure displays the expression levels averaged across replicates
+LDandHCAvgCols<-colnames(LDandHCExpfiltered)
+LDandHCAvgCols<-str_extract(LDandHCAvgCols,"ZT_[[:digit:]]*")
+
+# Calculate the means
+LDHCExprAvg<-tapply(colnames(LDandHCExpfiltered),INDEX = LDandHCAvgCols, function(x) rowSums(as.data.frame(LDandHCExpfiltered[,x]),na.rm = T)/length(x))
+
+# Becomes disordered with tapply, re-ordering the columns to be back in chronological order
+LDHCExprAvg<-do.call(cbind,LDHCExprAvg[order(as.numeric(sapply(strsplit(names(LDHCExprAvg),split = "_"),function(x) x[2])))])
+
+# Build a matrix of average expression across LDHC for the paralog pairs
+MEsMat<-do.call(rbind,strsplit(names(SigkMEsLDHCBr1vBr2),split = "_",fixed=T))
+row.names(MEsMat)<-names(SigkMEsLDHCBr1vBr2)
+
+# Currently, Br1 and Br2 are defined arbitrarily. Using the sign of the summed t-statistics from the limma output, we can define Br1 and Br2 non-arbitrarily
+MEsSign<-apply(LimmaModskMEs,1, function(x) sign(sum(x)))
+MedSign<-apply(LimmaModsMed,1, function(x) sign(sum(x)))
+MEsMat<-t(sapply(rownames(MEsMat),function(x) if(MEsSign[x]==1) MEsMat[x,1:2] else MEsMat[x,c(2,1)]))
+MEsMat<-cbind(LDHCExprAvg[MEsMat[,1],],LDHCExprAvg[MEsMat[,2],])
+
+# Normalize so the heatmap will display patterns
+m1<-t(apply(MEsMat,1,function(x) (x[1:24]-mean(x[1:24],na.rm=T))/sd(x[1:24],na.rm=T)))
+m2<-t(apply(MEsMat,1,function(x) (x[25:48]-mean(x[25:48],na.rm=T))/sd(x[25:48],na.rm=T)))
+MEsMat<-cbind(m1,m2)
+row.names(MEsMat)<-names(SigkMEsLDHCBr1vBr2)
+
+# Cluster the paralog pairs based on expression across Br1 and Br2
+MEsCor<-cor(t(MEsMat))
+MEsTree<-hclust(as.dist(1-MEsCor),method = "complete")
+
+# Clusters
+MEsClust<-cutreeDynamic(dendro = MEsTree, method = "tree", minClusterSize = 50, cutHeight = 1.5)
+
+# Re-assign cluster names
+MEsClustOrd<-setNames(paste("pDif_Cluster",1:length(unique(MEsClust)),sep=""),nm=unique(MEsClust[MEsTree$order]))
+MEsClust<-MEsClustOrd[as.character(MEsClust)]
+
+# Re-order the plotting of each paralog set based on the clusters
+MEsPlotOrd<-unlist(lapply(MEsClustOrd,function(x) which(MEsClust%in%x)))
+
+# Build a dataframe to input info into the pheatmap function to tell it how to annotate the clusters on the side of the heatmap
+MEsAnnot<-data.frame(row.names=MEsTree$labels,Cluster=MEsClust,stringsAsFactors = F)
+
+# Plot the heatmap
+plotMat<-NULL
+breakVec<-0
+for(cl in MEsClustOrd)
+{
+  tmpInds<-which(MEsClust==cl)
+  #print(length(tmpInds))
+  tmpMat<-rbind(MEsMat[tmpInds,1:24],MEsMat[tmpInds,25:48])
+  plotMat<-rbind(plotMat,tmpMat)
+  breakVec<-c(breakVec,length(tmpInds)+max(breakVec),(length(tmpInds)*2)+max(breakVec))
+  #breakVec<-c(breakVec,(length(tmpInds)*2)+max(breakVec))
+}
+#pdf(file.path(outputPath,"Figure3_A.pdf"),width = 4,height =20)
+pheatmap(mat = plotMat, scale = "row", cluster_cols = FALSE, treeheight_row = 0 , cluster_rows = FALSE, color = blueOrange[5:50], show_rownames = F, annotation_legend = T, gaps_row = breakVec, annotation_row = MEsAnnot, annotation_colors = list(Cluster=setNames(bgFunc(length(MEsClustOrd)),nm = MEsClustOrd)))
+#dev.off()
+
+# Repeat for the set of paralog pairs that have significantly different expression
+MedMat<-do.call(rbind,strsplit(names(SigMedLDHCBr1vBr2),split = "_",fixed=T))
+row.names(MedMat)<-names(SigMedLDHCBr1vBr2)
+
+# Re-order Br1 and Br2 so that the higher expressing paralog is always first
+MedMat<-t(sapply(rownames(MedMat),function(x) if(MedSign[x]==1) MedMat[x,1:2] else MedMat[x,c(2,1)]))
+MedMat<-cbind(LDHCExprAvg[MedMat[,1],],LDHCExprAvg[MedMat[,2],])
+row.names(MedMat)<-names(SigMedLDHCBr1vBr2)
+MedCor<-cor(t(MedMat))
+MedTree<-hclust(as.dist(1-MedCor),method = "complete")
+
+# Cluster
+MedClust<-cutreeDynamic(dendro = MedTree, method = "tree", minClusterSize = 75, cutHeight = 1.25)
+MedClustOrd<-setNames(paste("exDif_Cluster",1:length(unique(MedClust)),sep=""),nm=unique(MedClust[MedTree$order]))
+MedClust<-MedClustOrd[as.character(MedClust)]
+MedPlotOrd<-unlist(lapply(MedClustOrd,function(x) which(MedClust%in%x)))
+MedAnnot<-data.frame(row.names=MedTree$labels,Cluster=MedClust,stringsAsFactors = F)
+
+# Manually scale the data so that expression changes are evident
+MedMat<-t(apply(MedMat,1,function(x) (x-mean(x,na.rm=T))/sd(x,na.rm = T)))
+plotMat<-NULL
+breakVec<-0
+for(cl in MedClustOrd)
+{
+  tmpInds<-which(MedClust==cl)
+  #print(length(tmpInds))
+  tmpMat<-rbind(MedMat[tmpInds,1:24],MedMat[tmpInds,25:48])
+  plotMat<-rbind(plotMat,tmpMat)
+  breakVec<-c(breakVec,length(tmpInds)+max(breakVec),(length(tmpInds)*2)+max(breakVec))
+  #breakVec<-c(breakVec,(length(tmpInds)*2)+max(breakVec))
+}
+#pdf(file.path(outputPath,"Figure3_B.pdf"),width = 4,height =20)
+pheatmap(mat = plotMat, scale = "none", cluster_cols = FALSE, treeheight_row = 0 , cluster_rows = FALSE, color = blueOrange[5:50], show_rownames = F, annotation_legend = T, gaps_row = breakVec, annotation_row = MedAnnot, annotation_colors = list(Cluster=setNames(bgFunc(length(MedClustOrd)),nm = MedClustOrd)))
+#dev.off()
+```
+
+We can also look at these clusters individually using a ribbon plot in order to easily see pattern differences.
+
+```{r LDHC_RibbonPlots, fig.width=8, fig.height=4}
+MEsClusters<-tapply(names(SigkMEsLDHCBr1vBr2),INDEX = MEsClust,function(x) x)
+TCsMEs<-list(Br1=MEsMat[,1:24],Br2=MEsMat[,25:48])
+
+#pdf(file.path(outputPath,"Fig3_Ribbons.pdf"),width = 10,height = 5)
+for(i in 1:length(MEsClusters))
+{
+PlotTCsRibbon(TClst = TCsMEs, tgenes = MEsClusters[[i]],scale = T, tcols=c("red","blue"), tltys = c(1,2),main = paste(names(MEsClusters)[i],"  Gene#:",length(MEsClusters[[i]]),sep=" "))
+}
+#dev.off()
+```
+
+## GRN Construction in _B. rapa_ and Arabidopsis Using GENIE3
+
+We are interested in comparing _B. rapa_ paralog pairs with the corresponding single ortholog in Arabidopsis. To do this, we have decided that the most robust method is to compare the predicted targets of a gene regulatory network.
+
+Here we introduce Arabidopsis data. This data is a collection of publicly available microarray data sets compiled by Todd Mockler's group. The data can be found here:
+ftp://www.mocklerlab.org/diurnal/expression_data/Arabidopsis_thaliana_data.tab.gz
+
+We have extracted 4 of these data sets and re-organized them into matrix format .csv files. The supplemental file is called: **'At_ExpressionData.csv'**. This file should be placed in the 'rawDataPath' folder.
+
+```{r AtDataLoad}
+# Load the Arabidopsis data sets
+AtData<-read.csv(file.path(rawDataPath,"At_ExpressionData.csv"),stringsAsFactors = F)
+AtDataSet<-AtData$X.1
+AtDataRows<-AtData$X
+AtData<-AtData[,-c(1,2)]
+AtData<-as.matrix(AtData)
+rownames(AtData)<-AtDataRows
+
+# Split it up into separate data sets
+AtExp<-tapply(X = 1:nrow(AtData),INDEX = AtDataSet,function(x) as.matrix(AtData[x,])) 
+
+# Make unique colnames
+for(exp in 1:length(AtExp))
+  {
+    colnames(AtExp[[exp]])<-paste(names(AtExp)[exp],colnames(AtExp[[exp]]),sep="_")
+  }
+AtExpLog<-lapply(AtExp,function(x) log2(x))
+
+# Filter the genes so that they must have at least one value > 2 in all 4 runs
+AtExpressed<-lapply(AtExpLog,function(x) apply(x,1,function(y) max(y)>2))
+AtExpressed<-names(which(AtExpressed[[1]] & AtExpressed[[2]] & AtExpressed[[3]] & AtExpressed[[4]]))
+AtExpFiltered<-do.call(cbind,lapply(AtExpLog,function(x) x[AtExpressed,]))
+```
+  
+Now we load in the mapping between _B. rapa_ and Arabidopsis orthologs. The supplemental file is called **'Brapa_Ath_Orthologues.csv'**. This file should be placed in the 'rawDataPath' folder.
+
+```{r OrthologLoad}
+# Load the ortholog data
+LDHCfiltered<-LDandHCExpfiltered
+AtBr<-read.csv(file.path(rawDataPath,"Brapa_Ath_Orthologues.csv"),stringsAsFactors = F)
+AtBr<-AtBr[,5:6]
+
+# Remove all BRs with no At ortholog
+AtBrOrthoTargets<-AtBr[which((AtBr$BRA %in% rownames(LDHCfiltered))&(AtBr$Ath_ortho %in% rownames(AtExpFiltered))),]
+
+# Define all possible (detected) target genes for both networks
+AtTargets<-unique(AtBrOrthoTargets$Ath_ortho)
+BrTargets<-unique(AtBrOrthoTargets$BRA)
+```
+
+Now we need to define the set of transcription factors (TFs) for each of the networks.
+
+For arabidopsis, we selected TFs from the Arabidopsis TF database (https://agris-knowledgebase.org/AtTFDB/). We have included a supplemental file of the TFs called:
+**'At_TFList.csv'**.
+
+For _B. rapa_, we selected TFs using the MapMan automated gene annotation software, MERCATOR (https://mapman.gabipd.org/app/mercator), and taking all genes with the annotation "Transcriptional Control: 27.3". We have included a supplemental file called: **'Brapa_TFList.csv'**.
+
+The last TF file is a set of genes known to be part of the central plant oscillator (clock genes). We add these as potential regulators (nearly all of them are classified as TFs). This file is called: **'Brapa_At_ClockIDs.csv'**.
+
+All three of these files should be placed in the 'rawDataPath' folder.
+
+```{r TFLoad}
+# Load TF Data
+AtTFs<-read.csv(file.path(rawDataPath,"At_TFList.csv"),stringsAsFactors = F)
+AtTFs<-unique(AtTFs$Gene_ID)
+  
+BrTFs<-read.csv(file.path(rawDataPath,"Brapa_TFList.csv"),stringsAsFactors = F)
+BrTFs<-BrTFs$Accession
+  
+# Load clock genes
+clock<-read.csv(file.path(rawDataPath,"Brapa_At_ClockIDs.csv"),stringsAsFactors = F)
+AtClock<-unique(clock$ATG)
+BrClock<-unique(clock$BRA)
+AtTFs<-union(AtTFs,AtClock)
+BrTFs<-union(BrTFs,BrClock)
+  
+# Only consider the TFs that are expressed
+AtTFs<-intersect(AtTFs,row.names(AtExpFiltered))
+BrTFs<-intersect(BrTFs,rownames(LDHCfiltered))
+```  
+  
+Next, we construct our Gene Regulator Networks (GRNs) using the GENIE3 framework (https://github.com/aertslab/GENIE3).
+
+```{r Genie3, eval=F}
+# First, define the target and TF expression matrices
+AtTFsMat<-AtExpFiltered[AtTFs,]
+AtTargetMat<-AtExpFiltered[AtTargets,]
+BrTFsMat<-LDHCfiltered[BrTFs,]
+BrTargetMat<-LDHCfiltered[BrTargets,]
+  
+# Permute Target matrices to give 10,000 permuted targets
+AtTargetMatPerm<-matrix(data = sample(as.numeric(AtTargetMat),480000,replace = T),nrow = 10000, dimnames = list(row=paste("Decoy",1:10000,sep="_"),col=colnames(AtTargetMat)))
+BrTargetMatPerm<-matrix(data = sample(as.numeric(BrTargetMat),960000,replace = F),nrow = 10000, dimnames = list(row=paste("Decoy",1:10000,sep="_"),col=colnames(BrTargetMat)))
+
+# Build the weight matrices
+# ****If the R 'parallel' package is installed, I recommend increasing the 'nThr' parameter below ****
+AtWeights<-RS.Get.Weigth.Matrix(target.matrix = t(AtTargetMat), input.matrix = t(AtTFsMat),nThr = 1)
+BrWeights<-RS.Get.Weigth.Matrix(target.matrix = t(BrTargetMat), input.matrix = t(BrTFsMat),nThr = 1)
+AtWeightsPerm<-RS.Get.Weigth.Matrix(target.matrix = t(AtTargetMatPerm), input.matrix = t(AtTFsMat), nThr=1)
+BrWeightsPerm<-RS.Get.Weigth.Matrix(target.matrix = t(BrTargetMatPerm), input.matrix = t(BrTFsMat), nThr=1)
+  
+#****Save if you want to avoid re-running it in the future
+#save(AtWeights,BrWeights,AtWeightsPerm,BrWeightsPerm,file=file.path(outputPath,"GRN_WeightMatrix.RData"))
+  
+# Impose an FDR edge weight cutoff to determine significant edge scores
+AtWeightsCut<-CutGRNMat(tMat = AtWeights, pMat = AtWeightsPerm, cutPv = 0.05)
+BrWeightsCut<-CutGRNMat(tMat = BrWeights, pMat = BrWeightsPerm, cutPv = 0.05)
+  
+# Organize target groups
+AtTargetGroups<-apply(AtWeightsCut,2,function(x) rownames(AtWeightsCut)[which(x>0)])
+BrTargetGroups<-apply(BrWeightsCut,2,function(x) rownames(BrWeightsCut)[which(x>0)])
+```
+
+Once again, load the ortholog/paralog information and filter on groups that are present in the corresponding GRNs.
+
+```{r GRNHomologs}
+# Create the total set of 2-copy pairs
+Br2a<-setNames(BrOrtho2,nm = c("At","Br1","Br2"))
+Br2b<-setNames(BrOrtho3[,-2],nm = c("At","Br1","Br2"))
+Br2c<-setNames(BrOrtho3[,-3],nm = c("At","Br1","Br2"))
+Br2d<-setNames(BrOrtho3[,-4],nm = c("At","Br1","Br2"))
+Br2s<-rbind(Br2a,Br2b,Br2c,Br2d)
+  
+colnames(Br2s)<-colnames(BrOrtho2)
+  
+Br2s_At<-(Br2s$ATG %in% names(AtTargetGroups))
+Br2s_Br1<-(Br2s$BrOr1 %in% names(BrTargetGroups))
+Br2s_Br2<-(Br2s$BrOr2 %in% names(BrTargetGroups))
+
+# Find the At-Br1-Br2 sets where all three genes are TFs
+CommonTFs<-which(Br2s_At & Br2s_Br1 & Br2s_Br2)
+CommonGroups<-lapply(CommonTFs,function(x) list(Ath=AtTargetGroups[[Br2s[x,1]]],Br1=BrTargetGroups[[Br2s[x,2]]],Br2=BrTargetGroups[[Br2s[x,3]]]))
+names(CommonGroups)<-apply(Br2s[CommonTFs,],1,function(x) paste(x,collapse = "_"))
+
+# Only retain groups with at least 10 predicted targets for each TF
+ret<-which(sapply(CommonGroups,function(x) length(x[[1]])>=10 & length(x[[2]])>=10 & length(x[[3]])>=10))
+CommonGroupsCut<-CommonGroups[ret]
+```
+  
+### Identifying the Arabidopsis-like _B. rapa_ TF Based on Network Connectivity
+
+Now we have defined our 256 sets of At-Br1-Br2 TF homologs. We want to know, based on predicted target groups, if one of the Br TFs is more like the At TF.
+
+We cannot do a simple hypergeometric test between the target groups because the mapping of At - Br orthologs is not one-to-one. So in all cases, we map the At targets back to every possible Br ortholog, calculate the overlap between target groups and then compare this to a null distribution of overlap numbers that were generated separately for each At-Br1-Br2 triplet. The null distributions are generated by randomly re-shuffling the members of the Br1 and Br2 groups to end up with the same group sizes as the original and then running the same overlap test and repeating this 10,000 times.
+
+```{r GRN_TargetAtOverlap, eval=F}
+# Enrichment test for overlap between Br paralogs of At group and each Br Group
+CommonGroupsEnrich<-lapply(CommonGroupsCut,function(x) TargetOverlapStats(TargGroups = x,OrthoMat = AtBrOrthoTargets))
+
+# Run the same enrichment test 10,000 times after randomly swapping targets between the two Br groups
+CommonGroupsEnrichPerm<-lapply(CommonGroupsCut,function(x) sapply(1:10000,function(y) TargetOverlapStats(TargGroups = TargetGroupPerm(x), OrthoMat = AtBrOrthoTargets)))
+
+#****Save if you want to avoid re-running it in the future
+#save(CommonGroupsEnrichPerm,file=file.path(outputPath,"GRN_TargetOverlap_Permuted.RData"))
+  
+# The hypergeometric test is invalid since we have converted the At genes back to all possible versions of the Br genes. We use the mean and sd of the permuted distributions and assume these are normal distributions (they are), then calculate p-values.
+for(grp in names(CommonGroupsEnrich))
+  {
+    # Calculate test pvalues
+    CommonGroupsEnrich[[grp]][1]<-pnorm(q = CommonGroupsEnrich[[grp]][6]-1, mean = mean(CommonGroupsEnrichPerm[[grp]][6,]), sd = sd(CommonGroupsEnrichPerm[[grp]][6,]), lower.tail = F)
+    CommonGroupsEnrich[[grp]][2]<-pnorm(q = CommonGroupsEnrich[[grp]][7]-1, mean = mean(CommonGroupsEnrichPerm[[grp]][7,]), sd = sd(CommonGroupsEnrichPerm[[grp]][7,]), lower.tail = F)
+    # Calculate permutation pvalues
+    CommonGroupsEnrichPerm[[grp]][1,]<-pnorm(q = CommonGroupsEnrichPerm[[grp]][6,]-1, mean = mean(CommonGroupsEnrichPerm[[grp]][6,]), sd = sd(CommonGroupsEnrichPerm[[grp]][6,]), lower.tail = F)
+    CommonGroupsEnrichPerm[[grp]][2,]<-pnorm(q = CommonGroupsEnrichPerm[[grp]][7,]-1, mean = mean(CommonGroupsEnrichPerm[[grp]][7,]), sd = sd(CommonGroupsEnrichPerm[[grp]][7,]), lower.tail = F)
+  }
+  
+# In order to make plots easier to understand, we fix these results so that the more significant Br is always labeled as Br1 and the less significant one is always Br2.
+  
+# ID the groups where Br2 is more significant
+Br2Sigs<-which(sapply(CommonGroupsEnrich,function(x) x[2]<x[1]))
+
+# Now switch Br1 and B2 in these groups for the test and the permuted
+  for(flp in Br2Sigs)
+  {
+    tmpVec<-setNames(object = CommonGroupsEnrich[[flp]][c(2,1,3,5,4,7,6)], nm = names(CommonGroupsEnrich[[flp]]))
+    tmpNm<-rownames(CommonGroupsEnrichPerm[[flp]])
+    tmpMat<-CommonGroupsEnrichPerm[[flp]][c(2,1,3,5,4,7,6),]
+    rownames(tmpMat)<-tmpNm
+    CommonGroupsEnrich[[flp]]<-tmpVec
+    CommonGroupsEnrichPerm[[flp]]<-tmpMat
+    tmpNm<-strsplit(x = names(CommonGroupsEnrich)[flp],split = "_",fixed=T)[[1]]
+    tmpNm<-paste(tmpNm[c(1,3,2)],collapse = "_")
+    names(CommonGroupsEnrich)[flp]<-tmpNm
+    names(CommonGroupsEnrichPerm)[flp]<-tmpNm
+  }
+```  
+
+Now that we have calculated pvalues for the significance of Br1 and Br2 overlaps with the At target genes, we want to know which of the 256 At-Br1-Br2 TF triplets represents a case where one of the Br TFs has maintained At-like behavior while the other Br TF has diverged. In other words do we see cases where one Br is significantly more At-like than the other. To run this test, we can use the same permuted distributions from the previous block. This time, we simply caclulate the difference in the Br1 and Br2 pvalues (using log10 transformation), then simply repeat this for the 10,000 permuted sets and identify cases where the difference is larger than expected. 
+
+```{r GRN_TargetOverlapDiff}
+# Take the difference of the Group1 vs. Group2
+CommonGroupsEnrichDiffPerm<-lapply(CommonGroupsEnrichPerm,function(x) -log10(x[1,])--log10(x[2,]))
+CommonGroupsEnrichDiff<-sapply(CommonGroupsEnrich,function(x) -log10(x[1])--log10(x[2]))
+  
+# Calculate P-value of enrichment difference
+# When Group1 is more enriched (right tail)
+# Right tail is all we care about now since the Br genes were re-aranged so that the more enriched one is first
+CommonGroupsEnrichDiffPvalG1<-sapply(1:length(CommonGroupsEnrichDiff),function(x) length(which(CommonGroupsEnrichDiffPerm[[x]]>CommonGroupsEnrichDiff[x]))/10000)
+names(CommonGroupsEnrichDiffPvalG1)<-names(CommonGroupsEnrichDiff)
+```
+  
+Now, we plot the Br1-At Pvalues vs. the Br2-At Pvalues.
+
+```{r TargetOverlapPlot, fig.width=10, fig.height=5}
+x1<--log10(sapply(CommonGroupsEnrich,function(x) x[1]))
+x2<--log10(sapply(CommonGroupsEnrich,function(x) x[2]))
+Br1small <- sapply(CommonGroupsEnrich,function(x) x[4]<x[5])
+
+# Filter on differential enrichment
+rinds<-which(CommonGroupsEnrichDiffPvalG1<0.05)
+
+# The more significant Br (Br1) must have significant overlap
+min1<-which(x1>-log10(0.05))
+
+# Mark these triplets on the plot
+gene_inds<-intersect(min1,rinds)
+
+#pdf(file.path(outputPath,"Figure4_C.pdf"),width = 10,height = 5)
+ggplot(mapping = aes(x = x1, y = x2, color = factor(Br1small), shape = factor(1:length(x1) %in% gene_inds)))+
+    geom_point(size = 4, alpha=0.8) +
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed", color=rgb(0,0,0,0.5)) +
+    theme(panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.background = element_blank(),
+          axis.line = element_line(colour = "black"),
+          text = element_text(size=15),
+          legend.position = c(0.2, 0.85)) +
+    scale_y_continuous(expand = c(0, 0), limits = c(-0.1, 6)) +
+    scale_x_continuous(expand = c(0, 0), limits = c(-0.1, 12)) +
+    scale_color_discrete(labels = c("Larger Group More Enriched", "Smaller Group More Enriched")) +
+    xlab(expression(-log[10](Br1))) +
+    ylab(expression(-log[10](Br2))) +
+    labs(color = "") +
+    guides(shape = FALSE)
+#dev.off()
+```
+
+### GRN Analysis with Conserved Noncoding Sequences
+
+We do a similar analysis as above, but with CNSs as the target groups instead of genes. First, we get an annotation of CNSs in the At and Br genomes. Then, each target group is replaced with the unique set of CNSs associated with the genes in that target group.
+
+```{r CNS_Substitution}
+# Get CNS annotation
+CNS_map <- read.csv(file.path(rawDataPath, "At_Br_CNS_Annotation.csv"),stringsAsFactors = F)
+
+# Replace target genes with CNSs
+CNSGroups<-lapply(CommonGroupsCut, function(x) sapply(x, function(y) unique(CNS_map[CNS_map$gene %in% y, ]$cns)))
+```
+
+The following analysis is identical to the computation of the overlap and differential overlap above, but only with CNSGroups instead of the original network.
+
+```{r CNS_Overlap, eval=F}
+# Enrichment test for overlap between Br paralogs of At group and each Br Group
+CommonGroupsEnrichCNS<-lapply(CNSGroups,function(x) TargetOverlapStats(TargGroups = x))
+
+# Run the same enrichment test 10,000 times after randomly swapping targets between the two Br groups
+CommonGroupsEnrichPermCNS<-lapply(CNSGroups,function(x) sapply(1:10000,function(y) TargetOverlapStats(TargGroups = TargetGroupPerm(x))))
+
+#****Save if you want to avoid re-running it in the future
+save(CommonGroupsEnrichPermCNS,file=file.path(outputPath,"GRN_TargetOverlap_CNS_Permuted.RData"))
+  
+# The hypergeometric test is invalid since we have converted the At genes back to all possible versions of the Br genes so we use the mean and sd of the permuted distributions and assume these are normal distributions (they are), then calculate p-values.
+  for(grp in names(CommonGroupsEnrichCNS))
+  {
+    # calculate test pvalues
+    CommonGroupsEnrichCNS[[grp]][1]<-pnorm(q = CommonGroupsEnrichCNS[[grp]][6]-1, mean = mean(CommonGroupsEnrichPermCNS[[grp]][6,]), sd = sd(CommonGroupsEnrichPermCNS[[grp]][6,]), lower.tail = F)
+    CommonGroupsEnrichCNS[[grp]][2]<-pnorm(q = CommonGroupsEnrichCNS[[grp]][7]-1, mean = mean(CommonGroupsEnrichPermCNS[[grp]][7,]), sd = sd(CommonGroupsEnrichPermCNS[[grp]][7,]), lower.tail = F)
+    # calculate permutation pvalues
+    CommonGroupsEnrichPermCNS[[grp]][1,]<-pnorm(q = CommonGroupsEnrichPermCNS[[grp]][6,]-1, mean = mean(CommonGroupsEnrichPermCNS[[grp]][6,]), sd = sd(CommonGroupsEnrichPermCNS[[grp]][6,]), lower.tail = F)
+    CommonGroupsEnrichPermCNS[[grp]][2,]<-pnorm(q = CommonGroupsEnrichPermCNS[[grp]][7,]-1, mean = mean(CommonGroupsEnrichPermCNS[[grp]][7,]), sd = sd(CommonGroupsEnrichPermCNS[[grp]][7,]), lower.tail = F)
+  }
+
+# In order to make plots easier to understand, we fix these results so that the more significant Br is always labeled as Br1 and the less significant one is always Br2.
+# ID the groups where Br2 is more significant
+Br2Sigs<-which(sapply(CommonGroupsEnrichCNS,function(x) x[2]<x[1]))
+
+# Now switch Br1 and B2 in these groups for the test and the permuted
+  for(flp in Br2Sigs)
+  {
+    tmpVec<-setNames(object = CommonGroupsEnrichCNS[[flp]][c(2,1,3,5,4,7,6)], nm = names(CommonGroupsEnrichCNS[[flp]]))
+    tmpNm<-rownames(CommonGroupsEnrichPermCNS[[flp]])
+    tmpMat<-CommonGroupsEnrichPermCNS[[flp]][c(2,1,3,5,4,7,6),]
+    rownames(tmpMat)<-tmpNm
+    CommonGroupsEnrichCNS[[flp]]<-tmpVec
+    CommonGroupsEnrichPermCNS[[flp]]<-tmpMat
+    tmpNm<-strsplit(x = names(CommonGroupsEnrichCNS)[flp],split = "_",fixed=T)[[1]]
+    tmpNm<-paste(tmpNm[c(1,3,2)],collapse = "_")
+    names(CommonGroupsEnrichCNS)[flp]<-tmpNm
+    names(CommonGroupsEnrichPermCNS)[flp]<-tmpNm
+  }
+```
+
+```{r GRN_CNSOverlapDiff}
+# Take the difference of the Group1 vs. Group2
+CommonGroupsEnrichDiffPermCNS<-lapply(CommonGroupsEnrichPermCNS,function(x) -log10(x[1,])--log10(x[2,]))
+CommonGroupsEnrichDiffCNS<-sapply(CommonGroupsEnrichCNS,function(x) -log10(x[1])--log10(x[2]))
+  
+# Calculate P-value of enrichment difference
+# When Group1 is more enriched (right tail)
+# Right tail is all we care about now since the Br genes were re-aranged so that the more enriched one is first
+CommonGroupsEnrichDiffPvalG1CNS<-sapply(1:length(CommonGroupsEnrichDiffCNS),function(x) length(which(CommonGroupsEnrichDiffPermCNS[[x]]>CommonGroupsEnrichDiffCNS[x]))/10000)
+names(CommonGroupsEnrichDiffPvalG1CNS)<-names(CommonGroupsEnrichDiffCNS)
+```
+
+We plot the Br1-At and Br2-At pvalues in the CNS network.
+
+```{r CNS_ScatterPlot, fig.height=5, fig.width=10}
+x1<--log10(sapply(CommonGroupsEnrichCNS,function(x) x[1]))
+x2<--log10(sapply(CommonGroupsEnrichCNS,function(x) x[2]))
+Br1small <- sapply(CommonGroupsEnrichCNS,function(x) x[4]<x[5])
+
+# Filter on differential enrichment
+cns_rinds<-which(CommonGroupsEnrichDiffPvalG1CNS<0.05)
+
+# The more significant Br (Br1) must have significant overlap
+cns_min1<-which(x1>-log10(0.05))
+  
+# Mark these triplets on the plot
+cns_inds<-intersect(cns_min1,cns_rinds)
+  
+#pdf(file.path(outputPath,"Figure4_E.pdf"),width = 10,height = 5)
+ggplot(mapping = aes(x = x1, y = x2, color = factor(Br1small), shape = factor(1:length(x1) %in% cns_inds)))+
+    geom_point(size = 4, alpha=0.8) +
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed", color=rgb(0,0,0,0.5)) +
+    theme(panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.background = element_blank(),
+          axis.line = element_line(colour = "black"),
+          text = element_text(size=15),
+          legend.position = c(0.2, 0.85)) +
+    scale_y_continuous(expand = c(0, 0), limits = c(-0.1, 6)) +
+    scale_x_continuous(expand = c(0, 0), limits = c(-0.1, 12)) +
+    scale_color_discrete(labels = c("Larger Group More Enriched", "Smaller Group More Enriched")) +
+    xlab(expression(-log[10](Br1))) +
+    ylab(expression(-log[10](Br2))) +
+    labs(color = "") +
+    guides(shape = FALSE)
+#dev.off()
+
+sigGroups<-CommonGroupsEnrich[intersect(gene_inds,cns_inds)]
+sigGroupsCns<-CommonGroupsEnrichCNS[intersect(gene_inds,cns_inds)]
+```
+
+Now that we have a set of 35 triplets where Br1 is significantly more At-like than Br2, we want to compare the expression patterns of the TFs. Is Br1 always more correlated than Br2?
+
+```{r At_Br_TFexpressionCor}
+LDHCfiltered<-LDandHCExpfiltered
+
+# Summarize the expression data
+# For LDHC, average all datapoints for the same timepoint (reps and LD/HC)
+avgIndexBr <- sapply(strsplit(x = colnames(LDHCfiltered), split="_", fixed=T),function(x) x[3])
+
+# Take the mean at each timepoint
+LDHCfilteredMeans<- tapply(colnames(LDHCfiltered), INDEX = avgIndexBr, function(x) apply(LDHCfiltered[,x],1,mean))
+
+# Using tapply gets them out of order, now re-order time points based on chronology
+LDHCfilteredMeans<-LDHCfilteredMeans[order(as.numeric(names(LDHCfilteredMeans)))]
+
+# The data set is still in list format, make it a data frame
+LDHCfilteredMeans<-do.call(cbind,LDHCfilteredMeans)
+colnames(LDHCfilteredMeans)<-paste("ZT",colnames(LDHCfilteredMeans),sep="")
+  
+# For Arabidopsis, for each timepoint, take an average across all 4 datasets
+avgIndexAt <- sapply(strsplit(x = colnames(AtExpFiltered), split="_", fixed=T),function(x) x[3])
+ 
+# Take the mean at each timepoint
+AtExpFilteredMeans<- tapply(colnames(AtExpFiltered), INDEX = avgIndexAt, function(x) apply(AtExpFiltered[,x],1,mean))
+AtExpFilteredMeans<-AtExpFilteredMeans[order(as.numeric(gsub("ZT","",names(AtExpFilteredMeans))))]
+AtExpFilteredMeans<-do.call(cbind,AtExpFilteredMeans)
+ 
+# Define the triplets where Br1 is significantly more At-like than Br2 and Br1 has significant overlap with At.
+sigTFs<-strsplit(x = names(sigGroups), split = "_",fixed = T)
+  
+# Calculate correlations
+AtBr1_ExpCor<-sapply(sigTFs,function(x) cor(AtExpFilteredMeans[x[1],],LDHCfilteredMeans[x[2],seq(1,23,2)]))
+AtBr2_ExpCor<-sapply(sigTFs,function(x) cor(AtExpFilteredMeans[x[1],],LDHCfilteredMeans[x[3],seq(1,23,2)]))
+```  
+
+### Sequence and Expression Correlations of Br1-Br2-At Triplets
+
+We also want to look at the protein sequence of the TF triplets. Do we see that Br1 generally has higher sequence conservation with the At TF?
+
+```{r At_Br_TFblast}
+# Blast scores
+BlastBrAtLoci<-read.csv(file.path(rawDataPath,"At_Br_BlastResults.csv"),stringsAsFactors = F,row.names = 1)
+  
+#load("~/Documents/McClungLab/Brassica/Annotations/R500toAt11_AllBlast.RData")
+AtBr1Blast<-sapply(sigTFs,function(x) BlastBrAtLoci[which(BlastBrAtLoci$V1==x[2] & BlastBrAtLoci$V2==x[1]),"V12"][1])
+AtBr2Blast<-sapply(sigTFs,function(x) BlastBrAtLoci[which(BlastBrAtLoci$V1==x[3] & BlastBrAtLoci$V2==x[1]),"V12"][1])
+  
+# Some of these blast scores were too low to be returned, substitute with 1
+AtBr2Blast[is.na(AtBr2Blast)]<-1
+```  
+
+Now we want to plot this data.
+
+First, for comparison, plot the At-Br Gene Target Overlap significance of the Br1 and Br2 groups.
+
+```{r At_Br_GeneOverlapDist, fig.width=4, fig.height=5}
+# Calculate the significance of the distribution difference
+geneOver1=sapply(sigGroups,function(x) -log10(x[1]))
+geneOver2=sapply(sigGroups,function(x) -log10(x[2]))
+tpval=ks.test(x=geneOver1, y=geneOver2,alternative = "less")
+
+#pdf(file.path(outputPath,"Figure4_D.pdf"),width = 3,height = 5)
+ggboxplot(dList = list(Br1=geneOver1, Br2=geneOver2), ylab = "Target Gene Overlap (-log10(Pvalue))", col=c("grey40","grey60"), ylim = c(0,10),jitter = 0,paired = T, main = tpval$p.value, ledge = F)
+#dev.off() 
+```
+
+Now we plot the At-Br CNS overlap significance.
+
+```{r At_Br_CNSOverlapDist, fig.width=4, fig.height=5}
+# Calculate the significance of the distribution difference
+geneOver1=sapply(sigGroupsCns,function(x) -log10(x[1]))
+geneOver2=sapply(sigGroupsCns,function(x) -log10(x[2]))
+tpval=ks.test(x=geneOver1, y=geneOver2, alternative = "less")
+
+#pdf(file.path(outputPath,"Figure4_F.pdf"),width = 3,height = 5)
+ggboxplot(dList = list(Br1=geneOver1, Br2=geneOver2), ylab = "Target CNS Overlap (-log10(Pvalue))", col=c("grey40","grey60"), ylim = c(0,10),jitter = 0,paired = T, main = tpval$p.value, ledge = F)
+#dev.off() 
+```
+
+Now we plot the At-Br TF expression pattern correlation.
+
+```{r At_Br_ExpCorDist, fig.width=4, fig.height=5}
+# Calculate the significance of the distribution difference
+tpval=ks.test(x=AtBr1_ExpCor, y=AtBr2_ExpCor, alternative = "less")
+
+#pdf(file.path(outputPath,"Figure4_G.pdf"),width = 3,height = 5)
+ggboxplot(dList = list(Br1=AtBr1_ExpCor, Br2=AtBr2_ExpCor), ylab = "At to Br TF Pearson Correlation", col=c("grey40","grey60"), ylim = c(-0.75,1),jitter = 0,paired = T, main = tpval$p.value, ledge=F)
+#dev.off() 
+```
+
+Now we plot the At-Br TF sequence similarity.
+
+```{r At_Br_BlastDist, fig.width=4, fig.height=5}
+# Calculate the significance of the distribution difference
+tpval=ks.test(x=AtBr1Blast, y=AtBr2Blast, alternative = "less")
+
+#pdf(file.path(outputPath,"Figure4_H.pdf"),width = 3,height = 5)
+ggboxplot(dList = list(Br1=AtBr1Blast, Br2=AtBr2Blast), ylab = "At to Br TF Blast Bit Score", col=c("grey40","grey60"), ylim = c(0,2000),jitter = 0,paired = T, main = tpval$p.value, ledge=F)
+#dev.off() 
+```  
+
+## Examining Divergence in Drought Response Among Retained Paralogs
+
+Here we introduce the second data set used in this study. This is a timecourse taken under diel conditions for well-watered control plants and plants that have been exposed to mild drought.
+
+The raw reads can be found on SRA: SRP094509.
+
+More data and info is also available through NCBI GEO: Accession: GSE90841 (https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE90841)
+
+The GEO data sets provide FPKM tables but it was mapped to an older genome version. With this publication, we provide a supplemental table with updated raw counts mapped to the new R500 genome (https://genomevolution.org/CoGe/OrganismView.pl?org_name=Brassica%20rapa). This file is called **'DroughtTImeCourse_CountTable.csv'**. Make sure to place this into your 'rawDataPath' folder.
+
+### Raw Data Processing
+
+First we load and normalize the data using edgeR.
+
+```{r LoadDrought}
+cnts<-read.csv(file.path(rawDataPath,"DroughtTimeCourse_CountTable.csv"),stringsAsFactors = F,row.names = 1)
+
+# Rename the colums in terms of replicates (R1,R2) and treatments (Watered vs Drought)
+colnms<-colnames(cnts)
+colnms<-gsub("S1","R1_",colnms)
+colnms<-gsub("S2","R2_",colnms)
+colnms<-gsub("D","Drought_",colnms)
+colnms<-gsub("W","Watered_",colnms)
+
+# Reorder by time
+tCol<-strsplit(colnms,split = "_",fixed=T)
+tTime<-sapply(tCol,function(x) x[3])
+tTime<-str_pad(string = tTime, width = 2, pad = "0")
+tCol<-sapply(1:length(tCol),function(x) paste(tCol[[x]][1],tCol[[x]][2],tTime[x],sep="_"))
+
+colnames(cnts)<-tCol
+cnts<-cnts[,order(tCol)]
+
+# Normalize with edgeR
+cntsDge<- DGEList(counts = cnts)
+cntsDge<- calcNormFactors(cntsDge)
+DroughtLog<- rpkm(cntsDge, log=T, gene.length = BrLengths[rownames(cnts)], prior.count=0.5)
+```
+
+Next, filter the genes to only retain genes with at least one sample with log10(FPKM) > 0.
+
+```{r DroughtFilter}
+Droughtfiltered<-DroughtLog[which(apply(DroughtLog,1,function(x) max(x)>0)),]
+```
+
+Here we also do a filter on gene expression variance. This data set consists of 4 separate time courses with 2 replicates each for drought and watered conditions. It is possible for a gene to be expressed in one but not all of these time courses. If so, the un-expressed time course may have all-zero counts and therefore no variance. This will cause warnings in our analysis later and so we filter them out here. In such a case, we are not able to reliably determine differential patterning since one or more time courses do not have enough data to measure the expression pattern. Note that this variance filter step is not absolutely necessary since limma is set up to handle these cases by simply calling them as NOT significant. 
+
+```{r DroughtVarFilter}
+tmp<-Droughtfiltered
+
+# First we must separate out the 4 individual time-courses
+spNms<-strsplit(x = colnames(Droughtfiltered), split = "_")
+tnms<-sapply(spNms,function(x) paste(x[c(2,1)],collapse = "."))
+colnames(tmp)<-sapply(spNms,function(x) paste("ZT",((as.numeric(x[3])-1)*4),sep="-"))
+TCsDrought<-tapply(1:length(tnms),INDEX = tnms, function(x) tmp[,x])
+
+# Filter - each gene must have at least one sample with fpkm > 0 and must vary in all conditions
+varFiltered<-lapply(TCsDrought,function(x) apply(x,1,function(y) var(y)>1e-10))
+varFiltered<-do.call(cbind,varFiltered)
+varFiltered<-apply(varFiltered,1,function(x) all(x))
+varFiltered<-names(varFiltered)[which(varFiltered)]
+TCsDrought<-lapply(TCsDrought,function(x) x[varFiltered,])
+```
+
+### Pattern Analysis of Retained Paralogs Under Control Conditions
+
+Next we perform the _B. rapa_ paralog comparison on this new data set looking only at the well-watered control experiment.
+
+First re-define our paralogs. Filter on expressed genes and also only look at Br paralogs.
+
+```{r Drought_paralogs}
+# Again define the B. rapa paralogs that are detected in this dataset and are also cycling in the the LDHC data
+Br2a<-setNames(BrOrtho2,nm = c("At","Br1","Br2"))
+Br2b<-setNames(BrOrtho3[,-2],nm = c("At","Br1","Br2"))
+Br2c<-setNames(BrOrtho3[,-3],nm = c("At","Br1","Br2"))
+Br2d<-setNames(BrOrtho3[,-4],nm = c("At","Br1","Br2"))
+Br2s<-rbind(Br2a,Br2b,Br2c,Br2d)
+
+# Assign some row names
+rownames(Br2s)<-paste(Br2s[,2],Br2s[,3],sep="_")
+Br2s<-Br2s[which(Br2s[,2]%in%varFiltered & Br2s[,3]%in%varFiltered),-1]
+Br2sCyc<-Br2s[which(Br2s[,1]%in%LDandHCCycling & Br2s[,2]%in%LDandHCCycling),]
+```
+
+```{r Drought_Br1vBr2, eval=F}
+# Split up Orthologs
+TCsDroughtPara<-unlist(lapply(setNames(colnames(Br2s),nm = colnames(Br2s)),function(x) lapply(TCsDrought,function(y) y[Br2s[,x],])),recursive = F)
+for(i in names(TCsDroughtPara))
+{
+  rownames(TCsDroughtPara[[i]])<-rownames(Br2s)
+}
+TCsAll<-do.call(rbind,TCsDroughtPara)
+
+# Run WGCNA
+BlockModsDroughtPara<- blockwiseModules(datExpr = t(TCsAll), power = 10, networkType = "signed", corType="bicor", TOMType="signed", minModuleSize=100, mergeCutHeight=0.2, deepSplit=1, pamRespectsDendro = F, nThreads = 4, verbose=7)
+
+#****Save if you want to avoid re-running it in the future
+#save(BlockModsDroughtPara,file=file.path(outputPath,"DiPALM_DroughtPara_BlockMods.RData"))
+
+MEsPara<-BlockModsDroughtPara[[3]]
+
+# DiPALM Run for Br1 vs Br2 in Watered Control 
+# Define Models
+BrFact<-as.factor(rep(c("BR1","BR2"),each=2))
+design<-model.matrix(~0+BrFact)
+contr<-"BrFactBR1-BrFactBR2"
+
+# Calculate kMEs and kMeds
+kMEs<-BuildModMembership(MeMat = MEsPara, TCsLst = TCsDroughtPara[c(3,4,7,8)]) 
+kMeds<-sapply(TCsDroughtPara[c(3,4,7,8)],function(x) apply(x,1,function(y) median(y,na.rm = T)))
+
+# Build permuted version of TC list
+TCsParaPerm<-lapply(TCsDroughtPara[c(3,4,7,8)],function(x) x[sample(1:nrow(x),100000,replace = T),])
+kMEsPerm<-BuildModMembership(MeMat = MEsPara, TCsLst = TCsParaPerm)
+kMedsPerm<-sapply(TCsParaPerm,function(x) apply(x,1,function(y) median(y,na.rm = T)))
+
+LimmaModsMEs<-lapply(X = kMEs, function(x) BuildLimmaLM(dataMat = x, designMat = design, contrastStr = contr))
+LimmaModsMedN<-BuildLimmaLM(dataMat = kMeds, designMat = design, contrastStr = contr)
+
+LimmaModsMEs<-do.call(cbind,lapply(LimmaModsMEs,function(x) x$t))
+LimmaModsMedN<-LimmaModsMedN$t
+gc()
+
+LimmaModsMEsPerm<-lapply(X = kMEsPerm, function(x) BuildLimmaLM(dataMat = x, designMat = design, contrastStr = contr))
+LimmaModsMedNPerm<-BuildLimmaLM(dataMat = kMedsPerm, designMat = design, contrastStr = contr)
+
+LimmaModsMEsPerm<-do.call(cbind,lapply(LimmaModsMEsPerm,function(x) x$t))
+LimmaModsMedNPerm<-LimmaModsMedNPerm$t
+gc()
+
+TestSumsMEs<-apply(LimmaModsMEs,1, function(x) sum(abs(x)))
+TestSumsMedN<-apply(LimmaModsMedN,1, function(x) sum(abs(x)))
+
+PermSumsMEs<-apply(LimmaModsMEsPerm,1, function(x) sum(abs(x)))
+PermSumsMedN<-apply(LimmaModsMedNPerm,1, function(x) sum(abs(x)))
+
+AdjMEsWatered<-sapply(TestSumsMEs,function(x) AdjustPvalue(tVal = x, tVec = TestSumsMEs, pVec = PermSumsMEs))
+AdjMedWatered<-sapply(TestSumsMedN,function(x) AdjustPvalue(tVal = x, tVec = TestSumsMedN, pVec = PermSumsMedN))
+
+ggPlotMultiDensities(denslist = list(Test=TestSumsMEs,Permuted=PermSumsMEs), main = "Pattern Change Scores", xlab = "Differential Pattern Score", scale = F)
+ggPlotMultiDensities(denslist = list(Test=TestSumsMedN,Permuted=PermSumsMedN), main = "Expression Change Scores", xlab = "Differential Expression Score", scale = F)
+
+WateredMEs<-AdjMEsWatered[which(AdjMEsWatered<0.01)]
+WateredMed<-AdjMedWatered[which(AdjMedWatered<0.01)]
+```
+
+### Differential Drought Response
+
+Next we would like to determine the set of genes that show differential expression patterns in response to drought. We run DiPALM on watered vs. drought for all genes.
+
+```{r DiPALM_DroughtVsWatered, eval=F}
+TCsAll<-do.call(rbind,TCsDrought)
+
+BlockModsDrought<- blockwiseModules(datExpr = t(TCsAll), power = 10, networkType = "signed", corType="bicor", TOMType="signed", minModuleSize=100, mergeCutHeight=0.2, deepSplit=1, pamRespectsDendro = F, nThreads = 4, verbose=7)
+
+#****Save if you want to avoid re-running it in the future
+#save(BlockModsDrought,file=file.path(outputPath,"DiPALM_DroughtAll_BlockMods.RData"))
+
+# Extract MEs
+MEs<-BlockModsDrought[[3]]
+
+Treat<-as.factor(c("Drought","Drought","Watered","Watered"))
+design<-model.matrix(~0+Treat)
+colnames(design)<-levels(Treat)
+
+contr<-"Drought-Watered"
+
+# Run the limma models
+
+# Calculate kMEs and kMeds
+kMEs<-BuildModMembership(MeMat = MEs, TCsLst = TCsDrought) 
+kMeds<-sapply(TCsDrought,function(x) apply(x,1,function(y) median(y,na.rm = T)))
+
+# Build permuted version of TC list
+TCsDroughtPerm<-lapply(TCsDrought,function(x) x[sample(1:nrow(x),100000,replace = T),])
+kMEsPerm<-BuildModMembership(MeMat = MEs, TCsLst = TCsDroughtPerm) 
+kMedsPerm<-sapply(TCsDroughtPerm,function(x) apply(x,1,function(y) median(y,na.rm = T)))
+
+LimmaModsMEs<-lapply(kMEs, function(x) BuildLimmaLM(dataMat = x, designMat = design, contrastStr = contr))
+LimmaModsMed<-BuildLimmaLM(dataMat = kMeds, designMat = design, contrastStr = contr)
+LimmaModsMEs<-do.call(cbind,lapply(LimmaModsMEs,function(x) x$t))
+LimmaModsMed<-LimmaModsMed$t
+gc()
+
+LimmaModsMEsPerm<-lapply(kMEsPerm, function(x) BuildLimmaLM(dataMat = x, designMat = design, contrastStr = contr))
+LimmaModsMedPerm<-BuildLimmaLM(dataMat = kMedsPerm, designMat = design, contrastStr = contr)
+LimmaModsMEsPerm<-do.call(cbind,lapply(LimmaModsMEsPerm,function(x) x$t))
+LimmaModsMedPerm<-LimmaModsMedPerm$t
+gc()
+
+TestSumsMEs<-apply(LimmaModsMEs,1, function(x) sum(abs(x)))
+TestSumsMed<-apply(LimmaModsMed,1, function(x) sum(abs(x)))
+
+PermSumsMEs<-apply(LimmaModsMEsPerm,1, function(x) sum(abs(x)))
+PermSumsMed<-apply(LimmaModsMedPerm,1, function(x) sum(abs(x)))
+
+ggPlotMultiDensities(denslist = list(Test=TestSumsMEs,Permuted=PermSumsMEs), main = "Pattern Change Scores", xlab = "Differential Pattern Score", scale = F)
+ggPlotMultiDensities(denslist = list(Test=TestSumsMed,Permuted=PermSumsMed), main = "Expression Change Scores", xlab = "Differential Expression Score", scale = F)
+
+AdjMEsDr<-sapply(TestSumsMEs,function(x) AdjustPvalue(tVal = x, tVec = TestSumsMEs, pVec = PermSumsMEs))
+AdjMedN<-sapply(TestSumsMed,function(x) AdjustPvalue(tVal = x, tVec = TestSumsMed, pVec = PermSumsMed))
+
+SigMEsDrought<-AdjMEsDr[which(AdjMEsDr<0.01)]
+SigMedDrought<-AdjMedN[which(AdjMedN<0.01)]
+```
+
+We think it is important to compare our DiPALM method to a more standard approach of evaluating differential expression at individual time points and then taking the union genes that are differentially expressed at any time point to see if we gain or loose any genes compared to using DiPALM.
+
+```{r Limma_IndividualTimes}
+# Make the same model as above
+Treat<-as.factor(c("Drought","Drought","Watered","Watered"))
+design<-model.matrix(~0+Treat)
+colnames(design)<-levels(Treat)
+
+contr<-"Drought-Watered"
+# Run Drought vs. Watered Limma test for individual time points
+# First just rearange the drought data so that we get a separate expression matrix for each time point and put these in a list
+droughtTPs<-setNames(colnames(TCsDrought[[1]]),nm = colnames(TCsDrought[[1]]))
+DroughtIndividualTPs<-lapply(droughtTPs, function(x) do.call(cbind,lapply(TCsDrought,function(y) y[,x])))
+
+# Now we can use one of the DiPALM functions to apply the same limma model to our individual time points
+LimmaModsDroughtInd<-lapply(DroughtIndividualTPs, function(x) BuildLimmaLM(dataMat = x, designMat = design, contrastStr = contr))
+
+# Now we can just take a look at the limma results and determine which genes have differential expression
+LimmaDroughtIndPvals<-lapply(LimmaModsDroughtInd,function(x) topTable(fit = x, number = nrow(TCsDrought[[1]]), p.value = 1)$adj.P.Val)
+
+# For each timepoint, print out the number of genes with p-values < 0.05
+sapply(LimmaDroughtIndPvals,function(x) length(which(x<0.05)))
+```
+
+We can see that running the limma models on individual time points does not give us any significant drought responsive genes in this data set.
+
+### Examining Evidence of Paralog Divergence in Drought Response
+
+Now we want to see if we can detect any association between genes that respond to drought and _B. rapa_ paralog pairs that have divergent expression patterns. For this, we look for over-representation of drought responsive genes in the set of significantly divergent paralog pairs. We compare this with 10,000 sets of randomly chosen pairs from the list of all paralog pairs. 
+
+```{r DroughtAndParalogs}
+# We test both the set of paralogs that have pattern changes and the set that have expression changes. 
+# Sample a random set of pairs chosen from all pairs
+WateredMEpermME<-lapply(1:10000,function(x) Br2s[sample(1:nrow(Br2s),length(WateredMEs),replace = F),])
+WateredMedPermME<-lapply(1:10000,function(x) Br2s[sample(1:nrow(Br2s),length(WateredMed),replace = F),])
+
+# Determine the gene overlap of the sets in question
+testSigMEDiffP<-length(intersect(names(SigMEsDrought),unlist(strsplit(names(WateredMEs),"_"))))
+testSigMEDiffE<-length(intersect(names(SigMEsDrought),unlist(strsplit(names(WateredMed),"_"))))
+
+# Determine the expected distributions of overlaps (null distribution)
+permSigMEDiffP<-sapply(WateredMEpermME,function(x) length(intersect(unlist(x),names(SigMEsDrought))))
+permSigMEDiffE<-sapply(WateredMedPermME,function(x) length(intersect(unlist(x),names(SigMEsDrought))))
+```
+
+We find that differentially pattered copies are enriched for genes with drought responsive patterns but differentially expressed copies are NOT enriched for genes with drought responsive patterns.
+Now we plot the data.
+
+```{r DroughtParalogs_PlotA, fig.width=8, fig.height=4}
+tplot<-ggPlotMultiDensities(denslist = list("Pattern Change Pairs"=permSigMEDiffP, "Expression Change Pairs"=permSigMEDiffE), Ledge = T,xlab = "Number of Drought Responsive Genes", ylab = "Relative Frequency",lwidth = 1 ,cols = c("blue","orange"),main = "Null Distribution: Expected number of drought pattern responsive genes \n in Ortholog Pairs That have a pattern change (P-value = 0.0005)")
+tplot<-tplot+geom_vline(aes(xintercept=inter), color=c("blue","orange"), size=2, alpha=0.8, linetype=6, data = data.frame(inter=c(testSigMEDiffP,testSigMEDiffE)))
+
+#pdf(file.path(outputPath,"Figure5_A.pdf"), width = 8, height = 4)
+plot(tplot)
+#dev.off()
+```
+
+We can see that the paralog pairs that have divergent patterns are enriched for drought responsive genes. We next want to know if these paralog pairs are more likely to both be drought responsive or more likely that only one is drought responsive.
+
+```{r DroughtParalogs1or2}
+# First go through all the divergent paralogs and count the number of drought responsive pairs
+WateredMEsMat<-t(sapply(names(WateredMEs),function(x) strsplit(x,"_")[[1]]))
+WateredMEsCnt<-setNames(as.numeric(WateredMEsMat[,1] %in% names(SigMEsDrought))+as.numeric(WateredMEsMat[,2] %in% names(SigMEsDrought)),nm = rownames(WateredMEsMat))
+
+# Now repeat this for the set of 10,000 randomly selected pairs
+WateredMEsCntPerm<-sapply(WateredMEpermME,function(x) table(as.numeric(x[,1] %in% names(SigMEsDrought))+as.numeric(x[,2] %in% names(SigMEsDrought))))
+```
+
+Now we plot these results.
+
+```{r DroughtParalogs1or2Plot, fig.width=8, fig.height=4}
+tplot<-ggPlotMultiDensities(denslist = list("OneDroughtResponsive"=WateredMEsCntPerm[2,]), Ledge = F,xlab = "Number of pattern-change Pairs with ONE Drought-responsive Genes", ylab = "Relative Frequency",lwidth = 1 ,cols = "skyblue",main = "Null Distribution: Expected number of Ortholog Pairs where only one gene responds to drought\n (P-value < 0.0001)")
+tplot<-tplot+geom_vline(aes(xintercept=as.numeric(table(WateredMEsCnt)[2])), color="skyblue", size=2, alpha=0.8, linetype=6)
+
+#pdf(file.path(outputPath,"Figure5_B.pdf"), width = 8, height = 4)
+plot(tplot)
+#dev.off()
+
+tplot<-ggPlotMultiDensities(denslist = list("BothDroughtResponsive"=WateredMEsCntPerm[3,]), Ledge = F,xlab = "Number of pattern-change pairs where both are drought-responsive genes", ylab = "Relative Frequency",lwidth = 1 ,cols = "darkblue",main = "Null Distribution: Expected number of ortholog pairs where both gene respond to drought\n (P-value = 0.1852)")
+tplot<-tplot+geom_vline(aes(xintercept=as.numeric(table(WateredMEsCnt)[3])), color="darkblue", size=2, alpha=0.8, linetype=3)
+
+#pdf(file.path(outputPath,"Figure5_C.pdf"), width = 8, height = 4)
+plot(tplot)
+#dev.off()
+```
+
+We see that _B. rapa_ paralog pairs are enriched for pairs where only one gene is drought responsive. Now we want to see if there is an association between expression level of the pair and drought responsiveness (i.e. do we observe the drought responsive one usually being the higher or lower expressed gene in the pair?).
+
+```{r DroughtParalog_Expression, fig.width=8, fig.height=8, echo=TRUE}
+# First calculate the median expression levels for genes in the drought time course and also in the watered control.
+WateredMedian<-apply(Droughtfiltered[varFiltered,grep("Watered",colnames(Droughtfiltered))],1,function(x) median(x,na.rm = T))
+DroughtMedian<-apply(Droughtfiltered[varFiltered,grep("Drought",colnames(Droughtfiltered))],1,function(x) median(x,na.rm = T))
+
+# Pull out only the pairs where one gene is drought responsive.
+OneDroughtWateredMEs<-WateredMEsMat[which(WateredMEsCnt==1),]
+
+# Re-order pairs so that the drought-responsive gene is always the first one
+OneDroughtWateredMEs<-t(apply(OneDroughtWateredMEs,1,function(x) if(x[1]%in%names(SigMEsDrought)) x[1:2] else x[2:1]))
+
+# Now calculate the expression difference between pairs in watered and drought
+WateredDiff<-WateredMedian[OneDroughtWateredMEs[,1]]-WateredMedian[OneDroughtWateredMEs[,2]]
+DroughtDiff<-DroughtMedian[OneDroughtWateredMEs[,1]]-DroughtMedian[OneDroughtWateredMEs[,2]]
+DroughtUp<-which(sign(WateredDiff)==-1 & sign(DroughtDiff)==1)
+DroughtDown<-which(sign(WateredDiff)==1 & sign(DroughtDiff)==-1)
+
+# Color these switched ones and leave the rest light grey
+SwCols<-rep("grey80",length(DroughtDiff))
+SwCols[DroughtUp]<-"red"
+SwCols[DroughtDown]<-"blue"
+
+# Set the switched pairs to be colored and others to be more transparent
+SwAlpha<-rep(0.25,length(DroughtDiff))
+SwAlpha[c(DroughtUp,DroughtDown)]<-0.75
+SwCols<-sapply(1:length(SwCols),function(x) adjustcolor(col = SwCols[x], alpha.f = SwAlpha[x]))
+plot(WateredDiff,DroughtDiff,pch=20,col=SwCols,xlim=c(-5,5),ylim=c(-5,5), xlab="Paralog Expression Difference, Watered (Br1-Br2)", ylab="Paralog Expression Difference, Drought (Br1-Br2)")
+legend("topleft",legend = c("Drought Responsive Gene Becomes Higher-Expressing Paralog","Drought Responsive Gene Becomes Lower-Expressing Paralog"),col = c("red","blue"),pch=20)
+
+DrFactor<-apply(OneDroughtWateredMEs,1,function(x) c("Drought-Responsive","Non-Responsive"))
+ExFactorWatered<-apply(OneDroughtWateredMEs,1,function(x) if(WateredMedian[x[1]]>WateredMedian[x[2]]) c("W_High_Exp","W_Low_Exp") else c("W_Low_Exp","W_High_Exp"))
+ExFactorDrought<-apply(OneDroughtWateredMEs,1,function(x) if(DroughtMedian[x[1]]>DroughtMedian[x[2]]) c("D_High_Exp","D_Low_Exp") else c("D_Low_Exp","D_High_Exp"))
+
+#View the breakdown of drought-responsiveness vs median expression level
+table(as.character(DrFactor),as.character(ExFactorWatered))
+table(as.character(ExFactorDrought),as.character(ExFactorWatered),as.character(DrFactor))
+```
+
+
