@@ -2,12 +2,12 @@
 
 ## A detailed analysis of two separate transcriptomic data sets in _Brassica rapa_ using the novel R package 'DiPALM'.
 
-This repository contains an R markdown script (Brapa\_CircadianTranscriptome\_Markdown.Rmd) detailing the bioinformatics, statistical analysis and figure plotting that is published in the following manuscript (available [here](https://github.com/GreenhamLab/Brapa\_R500\_Circadian\_Transcriptome)):
+This repository contains an R markdown script (Brapa\_CircadianTranscriptome\_Markdown.Rmd) detailing the bioinformatics, statistical analysis and figure plotting that is published in the following manuscript (available [here](https://elifesciences.org/articles/58993)):
 
 ```
 Greenham K*, Sartor RC*, Zorich S, Lou P, Mockler TC, McClung CR (2020).
 Expansion of the circadian transcriptome in Brassica rapa and genome wide diversification of paralog expression patterns.
-Coming soon to a bioRxiv near you.
+eLife. 9:e58993 doi: 10.7554/eLife.58993
 *These authors contributed equally. 
 ```
 All other files in this repository are supplemental data or code files that are utilized in the R markdown script.
